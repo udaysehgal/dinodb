@@ -24,8 +24,8 @@ inline const char* value_type_name(ValueType t) {
 }
 
 // A single stored value. DinoDB keeps one struct per key rather than a
-// tagged union of heap containers: it costs a bit more memory per key than
-// FyroDB's inline/allocated hybrid layout, but it keeps the ownership and
+// tagged union of heap containers: it costs more memory per key than an
+// adaptive, size-tuned encoding would, but it keeps the ownership and
 // locking story simple, which is the tradeoff this project is making.
 struct Value {
     ValueType type = ValueType::String;

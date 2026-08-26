@@ -4,13 +4,9 @@ DinoDB is a small, from-scratch, Redis-protocol-compatible in-memory
 key-value store written in modern C++. You can talk to it with `redis-cli`
 or any standard Redis client library.
 
-It was inspired by [FyroDB](https://github.com/Rana718/FyroDB) (formerly
-FlashDB), a Rust in-memory database built around lock-free reads and
-epoch-based reclamation. DinoDB borrows the general idea — an in-memory,
-Redis-wire-compatible store built for concurrency — but is an independent
-implementation in a different language with a deliberately different
-architecture. See [Design differences](#design-differences-from-fyrodb)
-below.
+It speaks enough of the RESP wire protocol and command set to be a drop-in
+for basic Redis workloads, but its internals are quite different — see
+[Comparison with Redis](#comparison-with-redis) below.
 
 ## Features
 
@@ -21,25 +17,30 @@ below.
   startup)
 - Multi-threaded, sharded, concurrent store — no global lock
 
-## Design differences from FyroDB
+## Comparison with Redis
 
-DinoDB is not a port of FyroDB's code (it doesn't have access to it beyond
-its public README) — it's a separate implementation that makes different
-tradeoffs on purpose:
+DinoDB is not a Redis fork or port — it's a small independent
+implementation of a similar idea (an in-memory, RESP-speaking key-value
+store) with a much smaller feature set and a different concurrency model:
 
-| | FyroDB | DinoDB |
+| | Redis | DinoDB |
 |---|---|---|
-| Language | Rust | C++20 |
-| Concurrency | Lock-free reads via epoch-based reclamation + seqlocks; per-key spinlocks for writes | Sharded store, one `std::shared_mutex` per shard; reads take a shared lock, writes an exclusive lock on just that shard |
-| I/O model | epoll, one event loop pinned per core, `SO_REUSEPORT` kernel-level connection distribution | A dedicated acceptor thread hands off connections round-robin to a fixed worker pool, each worker running its own `poll()` loop — portable across Linux and macOS without conditional-compiled epoll/kqueue paths |
-| Memory layout | Inline storage for short keys/values, adaptive reclamation, defragmentation | One struct per key (simpler ownership, higher per-key overhead, no defrag) |
-| Data types | Strings, hashes, lists, sets, sorted sets, JSON, streams, bitmaps, HyperLogLog, geospatial | Strings, hashes, lists, sets, sorted sets |
-| Persistence | RDB-compatible snapshots | Its own simple length-prefixed binary snapshot format |
+| Language | C | C++20 |
+| Command execution | Single-threaded event loop (one thread runs all commands, so no locking is needed); optional multi-threaded socket I/O since Redis 6 | Multi-threaded throughout: keys are sharded across N `std::shared_mutex`-guarded buckets, and commands on different shards run genuinely in parallel |
+| I/O model | Custom `ae` event loop over epoll/kqueue/select | A dedicated acceptor thread round-robins new connections across a fixed worker pool, each worker running its own `poll()` loop |
+| Memory layout | Adaptive small-object encodings per type (`listpack`, `intset`, `embstr`, etc.) that switch representation by size | One fixed-layout struct per key holding all possible container types; simpler, but higher per-key memory overhead |
+| Data types | Strings, hashes, lists, sets, sorted sets, streams, bitmaps, HyperLogLog, geospatial | Strings, hashes, lists, sets, sorted sets |
+| Persistence | RDB snapshots and/or an append-only file (AOF) with configurable fsync policy | Periodic/manual snapshots only, in its own simple length-prefixed binary format |
+| Transactions / scripting | `MULTI`/`EXEC`, Lua scripting, functions | Not implemented |
+| Pub/Sub | Yes | Not implemented |
+| Replication / clustering | Primary-replica replication, Sentinel, Redis Cluster | Not implemented (single standalone process) |
 
-In short: FyroDB chases maximum single-node throughput with lock-free
-structures and per-core event loops. DinoDB optimizes for a small,
-readable codebase with an easy-to-reason-about locking model, at some cost
-to peak throughput.
+In short: Redis gets its safety from running commands on a single thread;
+DinoDB instead accepts real lock overhead in exchange for genuine
+multi-core parallelism on independent keys. Redis's feature set (scripting,
+replication, many more data types, tunable durability) is far broader —
+DinoDB is a much smaller project focused on the core KV/data-structure
+surface.
 
 ## Building
 
