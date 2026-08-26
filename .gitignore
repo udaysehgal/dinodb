@@ -1,0 +1,7 @@
+build/
+cmake-build-*/
+*.o
+*.rdb
+*.rdb.tmp
+.DS_Store
+compile_commands.json
