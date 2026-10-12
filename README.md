@@ -14,8 +14,12 @@ for basic Redis workloads, but its internals are quite different — see
 - Data types: strings, hashes, lists, sets, sorted sets
 - Key management: `EXPIRE` / `TTL` / `PERSIST`, `KEYS` glob matching, `TYPE`
 - Simple binary snapshot persistence (`SAVE`, periodic autosave, loaded at
-  startup)
-- Multi-threaded, sharded, concurrent store — no global lock
+  startup; a corrupt snapshot stops startup instead of being overwritten)
+- Multi-threaded, sharded, concurrent store — no global lock; every
+  single-key command is atomic
+- Lazy expiry plus a background sweep, so expired keys free their memory
+- Redis's protocol limits (1M args, 512MB bulk strings) to stop runaway
+  allocations from malformed clients
 
 ## Comparison with Redis
 
@@ -77,7 +81,7 @@ Set via flags or environment variables:
 | `--bind` | `DINODB_BIND` | `0.0.0.0` | Bind address |
 | `--workers` | `DINODB_WORKERS` | number of CPU cores | Worker thread count |
 | `--rdb` | `DINODB_RDB_PATH` | `dinodb.rdb` | Snapshot file path |
-| — | `DINODB_AUTOSAVE_SEC` | `300` | Autosave interval in seconds (`0` disables) |
+| `--autosave` | `DINODB_AUTOSAVE_SEC` | `300` | Autosave interval in seconds (`0` disables; a final save still happens on clean shutdown) |
 
 ## Supported commands
 
@@ -89,6 +93,10 @@ Set via flags or environment variables:
 - **Sorted sets:** `ZADD`, `ZSCORE`, `ZREM`, `ZCARD`, `ZINCRBY`, `ZRANGE` (with `WITHSCORES`)
 - **Server:** `PING`, `ECHO`, `INFO`, `SAVE`/`BGSAVE`, `SELECT`, `CONFIG` (stub)
 
+Multi-key commands (`MSET`, `MGET`, `DEL`, `EXISTS`) apply each key
+atomically but are not atomic as a whole, unlike in Redis. `SELECT` only
+accepts database `0`.
+
 Not yet implemented (contributions welcome): pub/sub, transactions
 (`MULTI`/`EXEC`), streams, bitmaps, HyperLogLog, geospatial commands, `SCAN`
 cursors.
@@ -99,6 +107,26 @@ cursors.
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
+
+The concurrency tests are most useful under a sanitizer build:
+
+```sh
+cmake -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DDINODB_SANITIZE=thread
+cmake --build build-tsan -j && ./build-tsan/tests/dinodb_tests
+```
+
+`DINODB_SANITIZE` also accepts `address`, `undefined`, or
+`address,undefined`. There is also an end-to-end stress test that drives
+a running server from 16 concurrent clients and checks that no `INCR`
+is lost:
+
+```sh
+./build/dinodb --port 7379 &
+python3 scripts/stress.py 7379
+```
+
+CI (GitHub Actions) runs all of this on Linux and macOS, in release mode
+and under TSan and ASan+UBSan, and also builds the Docker image.
 
 ## Docker
 

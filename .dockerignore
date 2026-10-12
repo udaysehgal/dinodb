@@ -1,0 +1,6 @@
+build/
+build-*/
+cmake-build-*/
+.git/
+*.rdb
+*.rdb.tmp

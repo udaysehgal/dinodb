@@ -1,8 +1,13 @@
 #include "dinodb/persistence.hpp"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
 #include <fstream>
+#include <utility>
+#include <vector>
 
 namespace dinodb::persistence {
 
@@ -24,12 +29,25 @@ bool read_u32(std::istream& is, uint32_t& v) { return static_cast<bool>(is.read(
 bool read_u8(std::istream& is, uint8_t& v) { return static_cast<bool>(is.read(reinterpret_cast<char*>(&v), sizeof(v))); }
 bool read_i64(std::istream& is, int64_t& v) { return static_cast<bool>(is.read(reinterpret_cast<char*>(&v), sizeof(v))); }
 bool read_double(std::istream& is, double& v) { return static_cast<bool>(is.read(reinterpret_cast<char*>(&v), sizeof(v))); }
+// Guards against a corrupt length field turning into a multi-GB allocation.
+constexpr uint32_t kMaxStrLen = 512u * 1024 * 1024;
+
 bool read_str(std::istream& is, std::string& s) {
     uint32_t len = 0;
-    if (!read_u32(is, len)) return false;
+    if (!read_u32(is, len) || len > kMaxStrLen) return false;
     s.resize(len);
     if (len == 0) return true;
     return static_cast<bool>(is.read(s.data(), len));
+}
+
+// ofstream can't fsync, so reopen the finished file just to flush it to
+// disk before it replaces the previous snapshot.
+bool fsync_path(const std::string& path) {
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    bool ok = ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
 }
 
 }  // namespace
@@ -42,7 +60,6 @@ bool save(Store& store, const std::string& path) {
     os.write(kMagic, sizeof(kMagic));
     write_u8(os, kVersion);
 
-    auto now = std::chrono::system_clock::now();
     store.for_each([&](const std::string& key, const Entry& e) {
         write_u8(os, static_cast<uint8_t>(e.value.type));
         write_str(os, key);
@@ -55,7 +72,6 @@ bool save(Store& store, const std::string& path) {
         } else {
             write_u8(os, 0);
         }
-        (void)now;
 
         switch (e.value.type) {
             case ValueType::String:
@@ -87,16 +103,21 @@ bool save(Store& store, const std::string& path) {
     });
 
     os.flush();
-    if (!os.good()) return false;
+    bool ok = os.good();
     os.close();
+    if (!ok || os.fail() || !fsync_path(tmp_path)) {
+        std::remove(tmp_path.c_str());
+        return false;
+    }
 
+    // rename() is atomic: readers see either the old snapshot or the new
+    // one, never a partial file.
     return std::rename(tmp_path.c_str(), path.c_str()) == 0;
 }
 
-bool load(Store& store, const std::string& path) {
-    std::ifstream is(path, std::ios::binary);
-    if (!is) return false;
+namespace {
 
+bool load_entries(std::istream& is, std::vector<std::pair<std::string, Entry>>& out) {
     char magic[4];
     if (!is.read(magic, sizeof(magic))) return false;
     if (std::memcmp(magic, kMagic, sizeof(kMagic)) != 0) return false;
@@ -172,10 +193,27 @@ bool load(Store& store, const std::string& path) {
             }
         }
 
-        store.restore(key, std::move(entry));
+        out.emplace_back(std::move(key), std::move(entry));
     }
 
-    return true;
+    return is.eof();
+}
+
+}  // namespace
+
+LoadResult load(Store& store, const std::string& path) {
+    std::ifstream is(path, std::ios::binary);
+    if (!is) return LoadResult::Missing;
+
+    std::vector<std::pair<std::string, Entry>> entries;
+    if (!load_entries(is, entries)) return LoadResult::Corrupt;
+
+    auto t = now();
+    for (auto& [key, entry] : entries) {
+        if (entry.expired(t) || entry.value.empty_container()) continue;
+        store.restore(key, std::move(entry));
+    }
+    return LoadResult::Ok;
 }
 
 }  // namespace dinodb::persistence

@@ -163,7 +163,7 @@ struct Value {
     std::deque<std::string> list;                  // List
     std::unordered_set<std::string> set;            // Set
     std::unordered_map<std::string, double> zscores; // ZSet: member -> score
-    std::multimap<double, std::string> zorder;       // ZSet: score -> member
+    std::set<std::pair<double, std::string>> zorder; // ZSet: (score, member)
 };
 
 struct Entry {
@@ -185,17 +185,19 @@ hazard pointers, no deferred frees.
 Sorted sets get two structures instead of one specifically so that
 `ZRANGE` (score-ordered) doesn't have to sort on every call: `zscores`
 answers "what's this member's score" in O(1), and `zorder` — a
-`std::multimap<double, std::string>` — keeps the score-sorted view
-maintained incrementally on every insert/update/remove:
+`std::set<std::pair<double, std::string>>` — keeps the score-sorted view
+maintained incrementally on every insert/update/remove. Ordering by the
+`(score, member)` pair, rather than a `multimap` keyed on score alone,
+buys two things: Redis's tie-break rule (members with equal scores sort
+lexicographically) falls out for free, and removing a member's stale
+entry is a single O(log n) `erase` instead of a scan over every member
+sharing that score:
 
 ```cpp
 void zset_put(const std::string& member, double score) {
     auto it = zscores.find(member);
     if (it != zscores.end()) {
-        // erase the stale (old_score -> member) entry from zorder first
-        auto range = zorder.equal_range(it->second);
-        for (auto r = range.first; r != range.second; ++r)
-            if (r->second == member) { zorder.erase(r); break; }
+        zorder.erase({it->second, member});  // drop the stale (old_score, member)
         it->second = score;
     } else {
         zscores.emplace(member, score);
@@ -204,32 +206,59 @@ void zset_put(const std::string& member, double score) {
 }
 ```
 
-### Lazy expiry
+### Holding the lock for the whole command
 
-TTLs are not swept by a background thread. Every read path
-(`get_mut`, `exists`, `ttl_seconds`, ...) checks `expires_at` against
-`now()` under the shard's lock it already had to take anyway, and
-evicts the entry on the spot if it's stale:
+Taking "one lock per command" literally matters. An early version of
+the `Store` API looked like this:
 
 ```cpp
 Entry* Store::get_mut(const std::string& key) {
     Shard& s = shard_for(key);
     std::unique_lock lock(s.mtx);
     auto it = s.map.find(key);
-    if (it == s.map.end()) return nullptr;
-    if (it->second.expired(std::chrono::system_clock::now())) {
-        s.map.erase(it);
-        return nullptr;
-    }
-    return &it->second;
+    ...
+    return &it->second;   // lock is released here...
 }
+// ...so the caller mutates the entry with no lock held at all.
 ```
 
-The cost is that a key nobody ever reads again outlives its TTL forever
-in memory. That's an acceptable trade for this project's scope — a
-background reaper thread is a natural next step, and it slots in
-cleanly because it would just call the same `for_each` used by `KEYS`
-and snapshotting.
+It returned a pointer into the shard *after* the lock had gone out of
+scope, so every command handler read and mutated values completely
+unsynchronized. Under load that showed up as lost `INCR`s (31,992 out of
+32,000 in a 16-client test) and, under ThreadSanitizer, as a crash
+inside `std::deque` while two `LPUSH`es raced on the same list.
+
+The fix is to never hand out a pointer that can outlive its lock. The
+`Store` now takes the work to the data instead: callers pass a lambda,
+and it runs while the shard lock is held:
+
+```cpp
+// Shared lock; e is nullptr if the key is missing or expired.
+c.store.read(key, [](const Entry* e) { ... });
+
+// Exclusive lock; the whole read-modify-write is atomic.
+c.store.write(key, [&](Slot& slot) {
+    Entry* e = slot.get();               // nullptr if absent
+    ...
+    slot.get_or_create(ValueType::String).value.str = std::to_string(cur);
+});
+```
+
+`Slot` is a small handle to one key's position in its shard. It also
+takes care of a Redis rule that is easy to forget: when its destructor
+runs (still under the lock), a list, set, hash or sorted set that a
+command just emptied is deleted, so `LPOP`ing the last element really
+does make the key disappear.
+
+### Expiry: lazy, plus a background sweep
+
+Every access checks `expires_at` against `now()` under the shard lock it
+already holds and treats a stale entry as missing (write paths erase it
+on the spot). On its own that means a key nobody ever reads again would
+outlive its TTL in memory forever, so a housekeeping thread also sweeps
+one shard every 100ms, erasing whatever has expired. A full pass over all
+32 shards takes about three seconds, and the sweep never holds more than
+one shard's lock at a time.
 
 ## The wire: a streaming RESP parser
 
@@ -255,7 +284,14 @@ private:
 If a complete request is sitting in the buffer it comes back immediately;
 if the buffer ends mid-length-prefix or mid-bulk-string, it returns
 `nullopt` and leaves `pos_` untouched, so the next `feed()` picks up
-exactly where parsing left off. The buffer is only compacted (bytes
+exactly where parsing left off.
+
+Because the parser buffers whatever the client claims is coming, it also
+enforces Redis's default limits (at most 1M arguments per request, 512MB
+per bulk string, 64KB per inline command) and never sizes an allocation
+from a client-supplied count. Anything malformed or over the limits puts
+the parser into a sticky error state; the server replies with
+`-ERR Protocol error: ...` and closes the connection. The buffer is only compacted (bytes
 before `pos_` erased) once it's grown past a threshold, so a stream of
 small pipelined requests doesn't pay a `memmove` per request.
 
@@ -288,7 +324,7 @@ flowchart LR
     Client1((client)) -->|connect| Acceptor
     Client2((client)) -->|connect| Acceptor
     Client3((client)) -->|connect| Acceptor
-    Acceptor["Acceptor thread\nblocking accept()"]
+    Acceptor["Acceptor thread\npoll() + accept()"]
     Acceptor -->|fd, round-robin| Q0["Worker 0 pending queue"]
     Acceptor -->|fd, round-robin| Q1["Worker 1 pending queue"]
     Q0 --> P0["Worker 0: poll() over its own fds"]
@@ -300,7 +336,9 @@ descriptor to worker *i*'s pending queue, only worker *i* ever calls
 `recv()`, `send()`, or `close()` on it. There is exactly one `std::mutex`
 in the entire networking layer — guarding each worker's pending-fd
 queue — and it's held only for the microseconds it takes to push or
-drain a `std::deque<int>`. No connection state is ever shared between
+drain a `std::deque<int>`. After queueing an fd, the acceptor writes one
+byte to that worker's wake-up pipe, which sits in the worker's `poll()`
+set, so the worker picks the connection up immediately. No connection state is ever shared between
 threads, so the per-connection buffers (`resp::Parser`, the pending
 output bytes) don't need any synchronization at all.
 
@@ -309,8 +347,11 @@ Each worker's loop, per iteration:
 1. Drain its pending queue into its local connection map (new fds only).
 2. Build a `pollfd` list: `POLLIN` always, plus `POLLOUT` if that
    connection has unsent reply bytes buffered.
-3. `poll()` with a 200ms timeout — short enough that a newly-assigned
-   connection is never invisible for long, long enough not to spin.
+3. `poll()` over those fds plus the wake-up pipe. The 200ms timeout
+   only bounds how quickly shutdown is noticed. An earlier version had no
+   wake-up pipe, so a new connection sat unnoticed until the timeout
+   expired and every client's first reply took ~200ms. With the pipe it
+   takes ~0.1ms.
 4. For each ready fd: drain `recv()` until `EAGAIN`, feed every byte to
    that connection's parser, `dispatch()` every complete request that
    falls out, append the encoded reply to the connection's outbound
@@ -319,7 +360,7 @@ Each worker's loop, per iteration:
 
 ## Command dispatch
 
-`dispatch()` is a flat, case-insensitive lookup over ~40 commands
+`dispatch()` is a case-insensitive hash-table lookup over ~60 commands
 covering five data types plus key/server management. No command object
 graph, no visitor pattern — just a function that takes a `Store&` and a
 parsed request and returns an already-RESP-encoded reply string:
@@ -334,12 +375,15 @@ parsed request and returns an already-RESP-encoded reply string:
 | Sorted sets | `ZADD` `ZSCORE` `ZREM` `ZCARD` `ZINCRBY` `ZRANGE` |
 | Server | `PING` `ECHO` `INFO` `SAVE`/`BGSAVE` `SELECT` `CONFIG` (stub) |
 
-Every handler follows the same shape: validate argument count and
-types up front (returning a RESP error immediately if they're wrong),
-then take exactly one lock through the `Store` API, mutate, and encode
-a reply. No handler holds a lock across more than one store call, which
-is what makes the "one command touches one shard" invariant hold in
-practice and not just on paper.
+Each table entry carries a Redis-style arity (`3` means exactly three
+arguments including the command name, `-3` means at least three), so
+argument-count errors are produced in one place with Redis's exact
+wording. Every handler then follows the same shape: parse and validate
+arguments up front (so a bad `ZADD` score can't leave a half-applied
+update), then do all its work on a key inside a single `Store::read` or
+`Store::write` call and encode the reply. Multi-key commands (`MSET`,
+`MGET`, `DEL`) take one shard lock per key in turn, so each key's update
+is atomic but, unlike in Redis, the command as a whole is not.
 
 ### Asymptotic cost per operation
 
@@ -348,11 +392,11 @@ practice and not just on paper.
 | `GET` / `SET` / `HGET` / `SADD` | O(1) amortized | hash lookup in one shard |
 | `LPUSH` / `RPOP` | O(1) | `std::deque` push/pop at either end |
 | `LRANGE start stop` | O(k) | k = size of the returned slice |
-| `ZADD` / `ZINCRBY` | O(log n) | `std::multimap` insert, n = zset size |
-| `ZRANGE start stop` | O(n) | walks `zorder` from the front to `stop` |
+| `ZADD` / `ZINCRBY` | O(log n) | `std::set` erase + insert, n = zset size |
+| `ZRANGE start stop` | O(start + k) | walks `zorder` from the front to `start`, then k results |
 | `KEYS pattern` | O(total keys) | full scan across all 32 shards |
 
-`ZRANGE`'s O(n) walk (rather than O(log n + k) via an order-statistics
+`ZRANGE`'s linear walk (rather than O(log n + k) via an order-statistics
 tree) and `KEYS`'s full scan are the two honest weak points in the
 current design — both are correct and simple, neither is what a
 production KV store would ship.
@@ -377,16 +421,24 @@ flowchart TB
 Each entry's payload shape depends on its type byte — a length-prefixed
 string for `String`, a count followed by key/value pairs for `Hash`,
 and so on for `List`/`Set`/`ZSet`. Writing is a single pass over
-`Store::for_each`, which takes each shard's lock just long enough to
-copy its live (non-expired) entries out — so a `SAVE` never blocks a
-command for longer than one shard's scan, and never blocks two shards
-at once.
+`Store::for_each`, which holds one shard's shared lock at a time while
+that shard's live (non-expired) entries are serialized. Reads proceed
+during a `SAVE`, and a write only waits if it targets the shard currently
+being written out. A mutex in `Server` also keeps a client `SAVE` and
+the autosave timer from writing the snapshot at the same time.
 
 Durability is via the standard write-temp-file, `fsync`, `rename`
 pattern: `SAVE` always writes to `dinodb.rdb.tmp` first and atomically
 renames it over `dinodb.rdb` only after every byte is flushed — a
 crash mid-write leaves the previous snapshot untouched rather than a
 half-written file.
+
+Loading is all-or-nothing. The whole file is parsed into a staging
+buffer first, and the store is only populated if every record checks
+out (with length fields sanity-capped so a corrupt one can't trigger a
+multi-gigabyte allocation). If the file is damaged, the server refuses
+to start, as Redis does. The alternative, starting empty, would let the
+next autosave quietly overwrite whatever was still recoverable.
 
 ## Concurrency safety invariants
 
@@ -396,10 +448,11 @@ enforced structurally rather than by convention:
 - **A key belongs to exactly one shard, always**, because
   `shard_for(key)` is a pure function of the key's hash — there is no
   code path where a key's shard changes over its lifetime.
-- **No handler holds a lock across a call it doesn't own.** `Store`'s
-  public API (`get_mut`, `get_or_create`, `del`, ...) takes and
-  releases its shard lock internally per call; command handlers never
-  reach into a `Shard` directly.
+- **No pointer into a shard outlives its lock.** Handlers only see
+  entries inside `Store::read`/`Store::write` callbacks, which run with
+  the shard lock held; command handlers never reach into a `Shard`
+  directly. The test suite runs under ThreadSanitizer in CI to keep it
+  that way.
 - **A connection's buffers are touched by exactly one thread.** Once
   the acceptor enqueues an fd to worker *i*, no other worker ever sees
   that fd again, so `resp::Parser` and the per-connection output buffer

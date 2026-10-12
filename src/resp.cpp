@@ -1,6 +1,7 @@
 #include "dinodb/resp.hpp"
 
-#include <cstdlib>
+#include <algorithm>
+#include <charconv>
 
 namespace dinodb::resp {
 
@@ -23,13 +24,30 @@ static size_t find_crlf(const std::string& s, size_t from) {
     return r;
 }
 
+// Parses the decimal number in buf_[from, to); false if it isn't one.
+static bool parse_len(const std::string& s, size_t from, size_t to, long& out) {
+    auto [end, ec] = std::from_chars(s.data() + from, s.data() + to, out);
+    return ec == std::errc{} && end == s.data() + to;
+}
+
+std::optional<Request> Parser::fail(const std::string& msg) {
+    error_ = "ERR Protocol error: " + msg;
+    return std::nullopt;
+}
+
 std::optional<Request> Parser::try_parse_multibulk() {
     size_t p = pos_;
     if (p >= buf_.size() || buf_[p] != '*') return std::nullopt;
 
     size_t line_end = find_crlf(buf_, p);
-    if (line_end == std::string::npos) return std::nullopt;
-    long count = std::strtol(buf_.c_str() + p + 1, nullptr, 10);
+    if (line_end == std::string::npos) {
+        if (buf_.size() - p > 32) return fail("invalid multibulk length");
+        return std::nullopt;
+    }
+    long count = 0;
+    if (!parse_len(buf_, p + 1, line_end, count) || count > kMaxArgs) {
+        return fail("invalid multibulk length");
+    }
     size_t cursor = line_end + 2;
 
     if (count < 0) {
@@ -38,19 +56,26 @@ std::optional<Request> Parser::try_parse_multibulk() {
     }
 
     Request req;
-    req.reserve(static_cast<size_t>(count));
+    // Don't trust the client's count for the allocation size.
+    req.reserve(static_cast<size_t>(std::min(count, 1024L)));
 
     for (long i = 0; i < count; ++i) {
-        if (cursor >= buf_.size() || buf_[cursor] != '$') return std::nullopt;
+        if (cursor >= buf_.size()) return std::nullopt;
+        if (buf_[cursor] != '$') return fail("expected '$', got '" + std::string(1, buf_[cursor]) + "'");
         size_t len_line_end = find_crlf(buf_, cursor);
-        if (len_line_end == std::string::npos) return std::nullopt;
-        long blen = std::strtol(buf_.c_str() + cursor + 1, nullptr, 10);
-        cursor = len_line_end + 2;
-        if (blen < 0) {
-            req.emplace_back();
-            continue;
+        if (len_line_end == std::string::npos) {
+            if (buf_.size() - cursor > 32) return fail("invalid bulk length");
+            return std::nullopt;
         }
+        long blen = 0;
+        if (!parse_len(buf_, cursor + 1, len_line_end, blen) || blen < 0 || blen > kMaxBulkLen) {
+            return fail("invalid bulk length");
+        }
+        cursor = len_line_end + 2;
         if (cursor + static_cast<size_t>(blen) + 2 > buf_.size()) return std::nullopt;
+        if (buf_[cursor + blen] != '\r' || buf_[cursor + blen + 1] != '\n') {
+            return fail("bulk string not terminated by CRLF");
+        }
         req.emplace_back(buf_, cursor, static_cast<size_t>(blen));
         cursor += static_cast<size_t>(blen) + 2;
     }
@@ -62,7 +87,10 @@ std::optional<Request> Parser::try_parse_multibulk() {
 std::optional<Request> Parser::try_parse_inline() {
     size_t p = pos_;
     size_t nl = buf_.find('\n', p);
-    if (nl == std::string::npos) return std::nullopt;
+    if (nl == std::string::npos) {
+        if (buf_.size() - p > kMaxInlineLen) return fail("too big inline request");
+        return std::nullopt;
+    }
 
     size_t end = nl;
     if (end > p && buf_[end - 1] == '\r') --end;
@@ -82,6 +110,7 @@ std::optional<Request> Parser::try_parse_inline() {
 }
 
 std::optional<Request> Parser::next() {
+    if (failed()) return std::nullopt;
     if (pos_ >= buf_.size()) {
         buf_.clear();
         pos_ = 0;

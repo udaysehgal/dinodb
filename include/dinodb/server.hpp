@@ -1,7 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -31,20 +33,26 @@ public:
     Store& store() { return store_; }
     const ServerConfig& config() const { return cfg_; }
 
+    // Serialized: SAVE from a client and the autosave timer never write the
+    // snapshot file at the same time.
     bool save_snapshot();
-    bool load_snapshot();
+
+    int64_t uptime_seconds() const;
 
     std::atomic<uint64_t> commands_processed{0};
     std::atomic<uint32_t> connected_clients{0};
+    std::atomic<uint64_t> expired_keys{0};
 
 private:
     ServerConfig cfg_;
     Store store_;
     std::atomic<bool> running_{false};
-    int listen_fd_ = -1;
+    std::mutex save_mtx_;
+    std::chrono::steady_clock::time_point started_at_ = std::chrono::steady_clock::now();
 
-    void autosave_loop();
-    std::thread autosave_thread_;
+    // Background housekeeping: active expiry plus periodic autosave.
+    void cron_loop();
+    std::thread cron_thread_;
 };
 
 }  // namespace dinodb
