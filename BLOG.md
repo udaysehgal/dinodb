@@ -488,6 +488,40 @@ client doing `SET other:key 1` on a different shard runs concurrently
 with both of these, untouched, on a third worker thread, the whole
 time.
 
+## Does the trade actually pay off?
+
+The point of all that locking is multi-core throughput, so I measured it
+(`scripts/bench.py`, Apple M4, against Redis 8.10; full tables in the
+README). Two things stood out.
+
+First, an honest benchmark on one laptop is harder than it looks. For
+small `GET`/`SET` requests, every server, Redis and DinoDB alike, landed
+at about 145k req/s without pipelining and about 2.2–2.4M with it. That is
+the ceiling of `redis-benchmark` and loopback TCP, not of either server.
+`redis-benchmark`'s own throughput numbers were also quantized for short
+runs (results snapped to exactly 1,000,000 or 2,000,000), so the script
+computes throughput from wall-clock time and records server CPU time per
+request, which doesn't depend on who the bottleneck is.
+
+Second, once the server *is* the bottleneck, the design delivers. With
+`LRANGE` returning 100–300 elements from one shared list, every request
+takes a `shared_lock` on the same shard and they all proceed in parallel:
+
+| | Redis | Redis, 4 I/O threads | DinoDB, 1 worker | DinoDB, 4 workers |
+|---|---:|---:|---:|---:|
+| `LRANGE 0 99` | 296k req/s | 333k | 250k | **399k** |
+| `LRANGE 0 299` | 121k req/s | 140k | 105k | **174k** |
+
+That's about 1.4x Redis, with lower p99 latency. Redis's I/O threads
+parallelize socket reads and writes, but command execution, including
+encoding those 300-element replies, still happens on one thread.
+
+The cost is just as clear. Per core, DinoDB is less efficient: a single
+worker needs 25–30% more CPU per request than Redis and trails it on
+every workload. Under light load, more workers means more CPU burned per
+request, because each wake-up handles fewer requests. Sharded locks buy
+parallelism; they don't buy efficiency.
+
 ## When this design is (and isn't) the right call
 
 DinoDB's sharded-mutex model is a genuine trade, not a strictly better

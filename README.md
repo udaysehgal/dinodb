@@ -41,10 +41,81 @@ store) with a much smaller feature set and a different concurrency model:
 
 In short: Redis gets its safety from running commands on a single thread;
 DinoDB instead accepts real lock overhead in exchange for genuine
-multi-core parallelism on independent keys. Redis's feature set (scripting,
+multi-core parallelism, on independent keys and on concurrent reads of
+the same key. [Benchmarks](#benchmarks) show where that trade pays off
+(server-bound work, ~1.4x Redis on 4 cores) and where it doesn't
+(per-core efficiency). Redis's feature set (scripting,
 replication, many more data types, tunable durability) is far broader —
 DinoDB is a much smaller project focused on the core KV/data-structure
 surface.
+
+## Benchmarks
+
+Measured with `scripts/bench.py` (wraps `redis-benchmark`) on an Apple M4
+(4 performance + 6 efficiency cores), macOS, against Redis 8.10.2. Client
+and server share the machine, so treat these as relative numbers. Each
+cell is the median of 3 runs on a fresh server; throughput comes from
+wall-clock time, and "CPU" is the server's user+sys CPU time per request.
+50 clients, `redis-benchmark --threads 4`; `redis-io4` is Redis with
+`--io-threads 4`, `dinodb-N` is DinoDB with `--workers N`.
+
+**Server-bound reads** (`LRANGE` on one shared 600-element list, pipeline
+depth 4). Each reply encodes 100 or 300 elements, so the work is in the
+server. This is the case DinoDB's design targets: readers share a
+`shared_lock`, so many cores serve the same hot key at once.
+
+| Config | LRANGE 0 99 (req/s) | p99 ms | CPU µs/req | LRANGE 0 299 (req/s) | p99 ms | CPU µs/req |
+|---|---:|---:|---:|---:|---:|---:|
+| redis | 295,930 | 1.13 | 3.14 | 121,089 | 2.39 | 7.77 |
+| redis-io4 | 332,873 | 0.98 | 5.47 | 140,240 | 2.00 | 9.95 |
+| dinodb-1 | 249,823 | 1.46 | 3.92 | 105,226 | 3.58 | 9.46 |
+| dinodb-2 | 332,926 | 1.10 | 5.54 | 150,797 | 2.30 | 12.32 |
+| dinodb-4 | **399,452** | 0.77 | 8.12 | 173,735 | 1.60 | 16.24 |
+| dinodb-8 | 399,389 | **0.63** | 8.92 | **181,575** | **1.24** | 17.27 |
+
+With 4+ workers DinoDB serves 1.35–1.5x Redis's throughput (1.2–1.3x
+Redis with I/O threads), with lower tail latency. Beyond 4 workers it
+levels off: there are only 4 performance cores, and the benchmark client
+needs them too.
+
+**Small requests** (`SET`/`GET`/`INCR` on random keys from a 1M keyspace):
+
+| Config | SET, P=1 | GET, P=1 | SET, P=16 | GET, P=16 | INCR, P=16 |
+|---|---:|---:|---:|---:|---:|
+| redis | 137,794 | 142,644 | 1,728,552 | 2,204,891 | 2,131,296 |
+| redis-io4 | 137,794 | 137,787 | 1,998,467 | 2,368,189 | 2,131,400 |
+| dinodb-1 | 147,985 | 147,996 | 1,390,442 | 1,599,068 | 1,522,788 |
+| dinodb-2 | 137,785 | 142,704 | 1,728,453 | 2,368,011 | 1,776,511 |
+| dinodb-4 | 147,975 | 147,986 | 2,204,967 | 2,367,638 | 2,131,030 |
+
+Here every server hits the same ceiling: about 140–150k req/s without
+pipelining and about 2.2–2.4M with it. That ceiling is the load generator
+and loopback on one laptop, not the servers, so these workloads can't
+separate them. They do show DinoDB scaling with workers (`SET` at P=16:
+1.39M → 2.20M from 1 to 4 workers).
+
+**Where DinoDB loses:**
+
+- **Per-core efficiency.** Single-threaded, DinoDB needs about 25–30%
+  more CPU per request than Redis (e.g. 0.75 vs 0.57 µs for pipelined
+  `SET`), and `dinodb-1` trails Redis throughout. Redis's single
+  event loop is very tightly optimized; DinoDB pays for locks, per-request
+  allocations, and rebuilding the `poll()` set on every loop iteration.
+- **CPU cost under light load.** Without pipelining, CPU per request
+  grows with the worker count (6.6 → 13.8 → 23.7 µs for 1/2/4 workers at
+  the same throughput). Each worker gets fewer requests per wake-up, so the
+  fixed cost of waking up isn't amortized. If you aren't CPU-bound, fewer
+  workers is cheaper. Redis's I/O threads show the same effect (15 µs vs 6).
+
+Reproduce with:
+
+```sh
+brew install redis   # or apt install redis-server redis-tools
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+python3 scripts/bench.py                                   # small requests
+python3 scripts/bench.py --tests lrange_100,lrange_300 --pipelines 4 \
+    --requests 500000 --configs redis,redis-io4,dinodb-1,dinodb-2,dinodb-4,dinodb-8
+```
 
 ## Building
 
