@@ -36,3 +36,4 @@ target_compile_options(dinodb PRIVATE -Wall -Wextra -Wpedantic)
 
 enable_testing()
 add_subdirectory(tests)
+add_subdirectory(bench)

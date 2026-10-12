@@ -5,7 +5,7 @@
 namespace dinodb {
 
 Slot::Slot(Shard::Map& map, const std::string& key) : map_(map), key_(key), it_(map.find(key)) {
-    if (it_ != map_.end() && it_->second.expired(now())) {
+    if (it_ != map_.end() && it_->second.expired_now()) {
         map_.erase(it_);
         it_ = map_.end();
     }

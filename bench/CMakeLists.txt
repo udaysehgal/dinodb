@@ -1,0 +1,2 @@
+add_executable(dinodb_micro_bench micro_bench.cpp)
+target_link_libraries(dinodb_micro_bench PRIVATE dinodb_core)

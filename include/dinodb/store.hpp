@@ -6,6 +6,8 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
+
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -20,10 +22,30 @@ namespace dinodb {
 // each guarded by its own std::shared_mutex. Reads take a shared lock,
 // writes take an exclusive lock, and only the single shard involved in a
 // key operation is ever blocked, so unrelated keys never contend.
+// Reader-writer lock over pthread_rwlock_t, usable with std::shared_lock /
+// std::unique_lock. libc++'s std::shared_mutex is built from a mutex plus
+// two condition variables, so even an uncontended lock/unlock pair costs
+// two mutex round-trips; pthread_rwlock_t is a single atomic fast path.
+class RwLock {
+public:
+    RwLock() { pthread_rwlock_init(&lock_, nullptr); }
+    ~RwLock() { pthread_rwlock_destroy(&lock_); }
+    RwLock(const RwLock&) = delete;
+    RwLock& operator=(const RwLock&) = delete;
+
+    void lock() { pthread_rwlock_wrlock(&lock_); }
+    void unlock() { pthread_rwlock_unlock(&lock_); }
+    void lock_shared() { pthread_rwlock_rdlock(&lock_); }
+    void unlock_shared() { pthread_rwlock_unlock(&lock_); }
+
+private:
+    pthread_rwlock_t lock_;
+};
+
 class Shard {
 public:
     using Map = std::unordered_map<std::string, Entry>;
-    std::shared_mutex mtx;
+    RwLock mtx;
     Map map;
 };
 
@@ -69,7 +91,7 @@ public:
         Shard& s = shard_for(key);
         std::shared_lock lock(s.mtx);
         auto it = s.map.find(key);
-        const Entry* e = (it == s.map.end() || it->second.expired(now())) ? nullptr : &it->second;
+        const Entry* e = (it == s.map.end() || it->second.expired_now()) ? nullptr : &it->second;
         return fn(e);
     }
 

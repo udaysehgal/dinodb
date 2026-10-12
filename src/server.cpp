@@ -21,6 +21,7 @@
 
 #include "dinodb/commands.hpp"
 #include "dinodb/persistence.hpp"
+#include "poller.hpp"
 
 namespace dinodb {
 
@@ -29,9 +30,12 @@ namespace {
 // Per-connection buffering state, owned by exactly one worker thread.
 struct ConnState {
     resp::Parser parser;
+    resp::Request req;  // reused across requests to avoid reallocating
     std::string outbuf;
     size_t outbuf_sent = 0;
     bool close_after_flush = false;  // QUIT or protocol error
+    bool want_write = false;         // write interest registered with the poller
+    bool closing = false;            // queued for close this iteration
 };
 
 // Work handed from the acceptor to a worker: a raw fd waiting to be
@@ -77,13 +81,11 @@ bool handle_readable(int fd, ConnState& cs, Server& server, char* buf, size_t bu
         }
     }
 
-    while (!cs.close_after_flush) {
-        auto req = cs.parser.next();
-        if (!req) break;
-        if (req->empty()) continue;
-        cs.outbuf += dispatch(server.store(), server, *req);
+    while (!cs.close_after_flush && cs.parser.next(cs.req)) {
+        if (cs.req.empty()) continue;
+        cs.outbuf += dispatch(server.store(), server, cs.req);
         server.commands_processed++;
-        if (is_quit(*req)) cs.close_after_flush = true;
+        if (is_quit(cs.req)) cs.close_after_flush = true;
     }
     if (cs.parser.failed() && !cs.close_after_flush) {
         cs.outbuf += resp::error(cs.parser.error());
@@ -113,53 +115,60 @@ bool flush_output(int fd, ConnState& cs) {
 
 void worker_loop(WorkerState& ws, std::atomic<bool>& running, Server& server) {
     std::unordered_map<int, ConnState> conns;
-    std::vector<pollfd> pfds;
+    std::vector<Poller::Event> events;
     std::vector<int> to_close;
     char buf[65536];
 
+    Poller poller;
+    if (!poller.ok() || !poller.add(ws.wake_r)) {
+        std::cerr << "dinodb: failed to create poller: " << strerror(errno) << "\n";
+        std::abort();
+    }
+
     while (running.load()) {
-        {
-            std::lock_guard<std::mutex> lock(ws.mtx);
-            while (!ws.pending.empty()) {
-                conns.emplace(ws.pending.front(), ConnState{});
-                ws.pending.pop_front();
-            }
-        }
-
-        pfds.clear();
-        pfds.reserve(conns.size() + 1);
-        pfds.push_back(pollfd{ws.wake_r, POLLIN, 0});
-        for (auto& [fd, cs] : conns) {
-            short events = POLLIN;
-            if (!cs.outbuf.empty()) events |= POLLOUT;
-            pfds.push_back(pollfd{fd, events, 0});
-        }
-
         // The timeout only bounds how long shutdown takes to notice running_.
-        int n = poll(pfds.data(), pfds.size(), 200);
-        if (n <= 0) continue;
-
-        if (pfds[0].revents & POLLIN) {
-            char drain[64];
-            while (::read(ws.wake_r, drain, sizeof(drain)) > 0) {
-            }
-        }
+        if (poller.wait(events, 200) <= 0) continue;
 
         to_close.clear();
-        for (size_t i = 1; i < pfds.size(); ++i) {
-            const pollfd& pfd = pfds[i];
-            if (pfd.revents == 0) continue;
-            ConnState& cs = conns.at(pfd.fd);
+        for (const Poller::Event& ev : events) {
+            if (ev.fd == ws.wake_r) {
+                char drain[64];
+                while (::read(ws.wake_r, drain, sizeof(drain)) > 0) {
+                }
+                std::lock_guard<std::mutex> lock(ws.mtx);
+                for (int fd : ws.pending) {
+                    if (poller.add(fd)) {
+                        conns.emplace(fd, ConnState{});
+                    } else {
+                        ::close(fd);
+                        server.connected_clients--;
+                    }
+                }
+                ws.pending.clear();
+                continue;
+            }
 
-            // Read before honoring POLLHUP so a client that sends a command
-            // and immediately half-closes still gets it executed.
-            bool ok = true;
-            if (pfd.revents & POLLIN) ok = handle_readable(pfd.fd, cs, server, buf, sizeof(buf));
-            if (ok && !cs.outbuf.empty()) ok = flush_output(pfd.fd, cs);
-            if (pfd.revents & (POLLERR | POLLNVAL)) ok = false;
-            if ((pfd.revents & POLLHUP) && !(pfd.revents & POLLIN)) ok = false;
+            auto it = conns.find(ev.fd);
+            if (it == conns.end() || it->second.closing) continue;
+            ConnState& cs = it->second;
+
+            // Read before honoring a hangup so a client that sends a command
+            // and immediately half-closes still gets it executed; the EOF
+            // itself shows up as recv() returning 0.
+            bool ok = !ev.error;
+            if (ok && ev.readable) ok = handle_readable(ev.fd, cs, server, buf, sizeof(buf));
+            if (ok && !cs.outbuf.empty()) ok = flush_output(ev.fd, cs);
             if (cs.close_after_flush && cs.outbuf.empty()) ok = false;
-            if (!ok) to_close.push_back(pfd.fd);
+            if (!ok) {
+                cs.closing = true;
+                to_close.push_back(ev.fd);
+                continue;
+            }
+            bool want_write = !cs.outbuf.empty();
+            if (want_write != cs.want_write) {
+                poller.set_write(ev.fd, want_write);
+                cs.want_write = want_write;
+            }
         }
         for (int fd : to_close) close_conn(fd, conns, server);
     }

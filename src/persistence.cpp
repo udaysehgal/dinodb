@@ -78,23 +78,23 @@ bool save(Store& store, const std::string& path) {
                 write_str(os, e.value.str);
                 break;
             case ValueType::Hash:
-                write_u32(os, static_cast<uint32_t>(e.value.hash.size()));
-                for (auto& [k, v] : e.value.hash) {
+                write_u32(os, static_cast<uint32_t>(e.value.hash().size()));
+                for (auto& [k, v] : e.value.hash()) {
                     write_str(os, k);
                     write_str(os, v);
                 }
                 break;
             case ValueType::List:
-                write_u32(os, static_cast<uint32_t>(e.value.list.size()));
-                for (auto& v : e.value.list) write_str(os, v);
+                write_u32(os, static_cast<uint32_t>(e.value.list().size()));
+                for (auto& v : e.value.list()) write_str(os, v);
                 break;
             case ValueType::Set:
-                write_u32(os, static_cast<uint32_t>(e.value.set.size()));
-                for (auto& v : e.value.set) write_str(os, v);
+                write_u32(os, static_cast<uint32_t>(e.value.set().size()));
+                for (auto& v : e.value.set()) write_str(os, v);
                 break;
             case ValueType::ZSet:
-                write_u32(os, static_cast<uint32_t>(e.value.zscores.size()));
-                for (auto& [member, score] : e.value.zscores) {
+                write_u32(os, static_cast<uint32_t>(e.value.zscores().size()));
+                for (auto& [member, score] : e.value.zscores()) {
                     write_str(os, member);
                     write_double(os, score);
                 }
@@ -156,7 +156,7 @@ bool load_entries(std::istream& is, std::vector<std::pair<std::string, Entry>>& 
                 for (uint32_t i = 0; i < n; ++i) {
                     std::string k, v;
                     if (!read_str(is, k) || !read_str(is, v)) return false;
-                    entry.value.hash.emplace(std::move(k), std::move(v));
+                    entry.value.hash().emplace(std::move(k), std::move(v));
                 }
                 break;
             }
@@ -166,7 +166,7 @@ bool load_entries(std::istream& is, std::vector<std::pair<std::string, Entry>>& 
                 for (uint32_t i = 0; i < n; ++i) {
                     std::string v;
                     if (!read_str(is, v)) return false;
-                    entry.value.list.push_back(std::move(v));
+                    entry.value.list().push_back(std::move(v));
                 }
                 break;
             }
@@ -176,7 +176,7 @@ bool load_entries(std::istream& is, std::vector<std::pair<std::string, Entry>>& 
                 for (uint32_t i = 0; i < n; ++i) {
                     std::string v;
                     if (!read_str(is, v)) return false;
-                    entry.value.set.insert(std::move(v));
+                    entry.value.set().insert(std::move(v));
                 }
                 break;
             }

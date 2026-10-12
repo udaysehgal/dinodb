@@ -274,11 +274,11 @@ std::string cmd_pttl(Ctx& c, const Request& r) { return resp::integer(c.store.tt
 std::string cmd_persist(Ctx& c, const Request& r) { return resp::integer(c.store.persist(r[1]) ? 1 : 0); }
 
 std::string cmd_keys(Ctx& c, const Request& r) {
-    std::vector<std::string> items;
+    resp::ArrayWriter reply;
     c.store.for_each([&](const std::string& k, const Entry&) {
-        if (glob_match(r[1].c_str(), k.c_str())) items.push_back(resp::bulk_string(k));
+        if (glob_match(r[1].c_str(), k.c_str())) reply.bulk(k);
     });
-    return resp::array(items);
+    return reply.finish();
 }
 
 std::string cmd_flushall(Ctx& c, const Request&) {
@@ -297,7 +297,7 @@ std::string cmd_hset(Ctx& c, const Request& r) {
         if (e.value.type != ValueType::Hash) return err_wrongtype();
         int64_t added = 0;
         for (size_t i = 2; i + 1 < r.size(); i += 2) {
-            if (e.value.hash.insert_or_assign(r[i], r[i + 1]).second) ++added;
+            if (e.value.hash().insert_or_assign(r[i], r[i + 1]).second) ++added;
         }
         return resp::integer(added);
     });
@@ -307,8 +307,8 @@ std::string cmd_hget(Ctx& c, const Request& r) {
     return c.store.read(r[1], [&](const Entry* e) {
         if (!e) return resp::nil_bulk();
         if (e->value.type != ValueType::Hash) return err_wrongtype();
-        auto it = e->value.hash.find(r[2]);
-        return it == e->value.hash.end() ? resp::nil_bulk() : resp::bulk_string(it->second);
+        auto it = e->value.hash().find(r[2]);
+        return it == e->value.hash().end() ? resp::nil_bulk() : resp::bulk_string(it->second);
     });
 }
 
@@ -318,7 +318,7 @@ std::string cmd_hdel(Ctx& c, const Request& r) {
         if (!e) return resp::integer(0);
         if (e->value.type != ValueType::Hash) return err_wrongtype();
         int64_t count = 0;
-        for (size_t i = 2; i < r.size(); ++i) count += static_cast<int64_t>(e->value.hash.erase(r[i]));
+        for (size_t i = 2; i < r.size(); ++i) count += static_cast<int64_t>(e->value.hash().erase(r[i]));
         return resp::integer(count);
     });
 }
@@ -327,7 +327,7 @@ std::string cmd_hexists(Ctx& c, const Request& r) {
     return c.store.read(r[1], [&](const Entry* e) {
         if (!e) return resp::integer(0);
         if (e->value.type != ValueType::Hash) return err_wrongtype();
-        return resp::integer(e->value.hash.count(r[2]) ? 1 : 0);
+        return resp::integer(e->value.hash().count(r[2]) ? 1 : 0);
     });
 }
 
@@ -336,12 +336,12 @@ std::string hash_dump(Ctx& c, const Request& r, bool keys, bool vals) {
     return c.store.read(r[1], [&](const Entry* e) {
         if (!e) return resp::empty_array();
         if (e->value.type != ValueType::Hash) return err_wrongtype();
-        std::vector<std::string> items;
-        for (auto& [k, v] : e->value.hash) {
-            if (keys) items.push_back(resp::bulk_string(k));
-            if (vals) items.push_back(resp::bulk_string(v));
+        resp::ArrayWriter reply;
+        for (auto& [k, v] : e->value.hash()) {
+            if (keys) reply.bulk(k);
+            if (vals) reply.bulk(v);
         }
-        return resp::array(items);
+        return reply.finish();
     });
 }
 
@@ -353,7 +353,7 @@ std::string cmd_hlen(Ctx& c, const Request& r) {
     return c.store.read(r[1], [](const Entry* e) {
         if (!e) return resp::integer(0);
         if (e->value.type != ValueType::Hash) return err_wrongtype();
-        return resp::integer(static_cast<int64_t>(e->value.hash.size()));
+        return resp::integer(static_cast<int64_t>(e->value.hash().size()));
     });
 }
 
@@ -364,8 +364,8 @@ std::string cmd_hincrby(Ctx& c, const Request& r) {
         Entry& e = slot.get_or_create(ValueType::Hash);
         if (e.value.type != ValueType::Hash) return err_wrongtype();
         int64_t cur = 0;
-        auto it = e.value.hash.find(r[2]);
-        if (it != e.value.hash.end()) {
+        auto it = e.value.hash().find(r[2]);
+        if (it != e.value.hash().end()) {
             auto v = parse_int(it->second);
             if (!v) return resp::error("ERR hash value is not an integer");
             cur = *v;
@@ -373,7 +373,7 @@ std::string cmd_hincrby(Ctx& c, const Request& r) {
         if (__builtin_add_overflow(cur, *delta, &cur)) {
             return resp::error("ERR increment or decrement would overflow");
         }
-        e.value.hash[r[2]] = std::to_string(cur);
+        e.value.hash()[r[2]] = std::to_string(cur);
         return resp::integer(cur);
     });
 }
@@ -385,10 +385,10 @@ std::string push(Ctx& c, const Request& r, bool left) {
         Entry& e = slot.get_or_create(ValueType::List);
         if (e.value.type != ValueType::List) return err_wrongtype();
         for (size_t i = 2; i < r.size(); ++i) {
-            if (left) e.value.list.push_front(r[i]);
-            else e.value.list.push_back(r[i]);
+            if (left) e.value.list().push_front(r[i]);
+            else e.value.list().push_back(r[i]);
         }
-        return resp::integer(static_cast<int64_t>(e.value.list.size()));
+        return resp::integer(static_cast<int64_t>(e.value.list().size()));
     });
 }
 
@@ -397,7 +397,7 @@ std::string pop(Ctx& c, const Request& r, bool left) {
         Entry* e = slot.get();
         if (!e) return resp::nil_bulk();
         if (e->value.type != ValueType::List) return err_wrongtype();
-        auto& list = e->value.list;
+        auto& list = e->value.list();
         if (list.empty()) return resp::nil_bulk();
         std::string reply = resp::bulk_string(left ? list.front() : list.back());
         if (left) list.pop_front();
@@ -415,7 +415,7 @@ std::string cmd_llen(Ctx& c, const Request& r) {
     return c.store.read(r[1], [](const Entry* e) {
         if (!e) return resp::integer(0);
         if (e->value.type != ValueType::List) return err_wrongtype();
-        return resp::integer(static_cast<int64_t>(e->value.list.size()));
+        return resp::integer(static_cast<int64_t>(e->value.list().size()));
     });
 }
 
@@ -438,11 +438,12 @@ std::string cmd_lrange(Ctx& c, const Request& r) {
         if (!e) return resp::empty_array();
         if (e->value.type != ValueType::List) return err_wrongtype();
         int64_t s, t;
-        std::vector<std::string> items;
-        if (resolve_range(*start, *stop, static_cast<int64_t>(e->value.list.size()), s, t)) {
-            for (int64_t i = s; i <= t; ++i) items.push_back(resp::bulk_string(e->value.list[i]));
+        resp::ArrayWriter reply;
+        const auto& list = e->value.list();
+        if (resolve_range(*start, *stop, static_cast<int64_t>(list.size()), s, t)) {
+            for (auto it = list.begin() + s; it != list.begin() + t + 1; ++it) reply.bulk(*it);
         }
-        return resp::array(items);
+        return reply.finish();
     });
 }
 
@@ -452,10 +453,10 @@ std::string cmd_lindex(Ctx& c, const Request& r) {
     return c.store.read(r[1], [&](const Entry* e) {
         if (!e) return resp::nil_bulk();
         if (e->value.type != ValueType::List) return err_wrongtype();
-        int64_t len = static_cast<int64_t>(e->value.list.size());
+        int64_t len = static_cast<int64_t>(e->value.list().size());
         int64_t i = *idx < 0 ? *idx + len : *idx;
         if (i < 0 || i >= len) return resp::nil_bulk();
-        return resp::bulk_string(e->value.list[i]);
+        return resp::bulk_string(e->value.list()[i]);
     });
 }
 
@@ -467,7 +468,7 @@ std::string cmd_sadd(Ctx& c, const Request& r) {
         if (e.value.type != ValueType::Set) return err_wrongtype();
         int64_t added = 0;
         for (size_t i = 2; i < r.size(); ++i) {
-            if (e.value.set.insert(r[i]).second) ++added;
+            if (e.value.set().insert(r[i]).second) ++added;
         }
         return resp::integer(added);
     });
@@ -479,7 +480,7 @@ std::string cmd_srem(Ctx& c, const Request& r) {
         if (!e) return resp::integer(0);
         if (e->value.type != ValueType::Set) return err_wrongtype();
         int64_t count = 0;
-        for (size_t i = 2; i < r.size(); ++i) count += static_cast<int64_t>(e->value.set.erase(r[i]));
+        for (size_t i = 2; i < r.size(); ++i) count += static_cast<int64_t>(e->value.set().erase(r[i]));
         return resp::integer(count);
     });
 }
@@ -488,7 +489,7 @@ std::string cmd_sismember(Ctx& c, const Request& r) {
     return c.store.read(r[1], [&](const Entry* e) {
         if (!e) return resp::integer(0);
         if (e->value.type != ValueType::Set) return err_wrongtype();
-        return resp::integer(e->value.set.count(r[2]) ? 1 : 0);
+        return resp::integer(e->value.set().count(r[2]) ? 1 : 0);
     });
 }
 
@@ -496,9 +497,9 @@ std::string cmd_smembers(Ctx& c, const Request& r) {
     return c.store.read(r[1], [](const Entry* e) {
         if (!e) return resp::empty_array();
         if (e->value.type != ValueType::Set) return err_wrongtype();
-        std::vector<std::string> items;
-        for (auto& m : e->value.set) items.push_back(resp::bulk_string(m));
-        return resp::array(items);
+        resp::ArrayWriter reply;
+        for (auto& m : e->value.set()) reply.bulk(m);
+        return reply.finish();
     });
 }
 
@@ -506,7 +507,7 @@ std::string cmd_scard(Ctx& c, const Request& r) {
     return c.store.read(r[1], [](const Entry* e) {
         if (!e) return resp::integer(0);
         if (e->value.type != ValueType::Set) return err_wrongtype();
-        return resp::integer(static_cast<int64_t>(e->value.set.size()));
+        return resp::integer(static_cast<int64_t>(e->value.set().size()));
     });
 }
 
@@ -527,7 +528,7 @@ std::string cmd_zadd(Ctx& c, const Request& r) {
         int64_t added = 0;
         for (size_t i = 0; i < scores.size(); ++i) {
             const std::string& member = r[3 + 2 * i];
-            if (!e.value.zscores.count(member)) ++added;
+            if (!e.value.zscores().count(member)) ++added;
             e.value.zset_put(member, scores[i]);
         }
         return resp::integer(added);
@@ -538,8 +539,8 @@ std::string cmd_zscore(Ctx& c, const Request& r) {
     return c.store.read(r[1], [&](const Entry* e) {
         if (!e) return resp::nil_bulk();
         if (e->value.type != ValueType::ZSet) return err_wrongtype();
-        auto it = e->value.zscores.find(r[2]);
-        return it == e->value.zscores.end() ? resp::nil_bulk() : resp::bulk_string(format_double(it->second));
+        auto it = e->value.zscores().find(r[2]);
+        return it == e->value.zscores().end() ? resp::nil_bulk() : resp::bulk_string(format_double(it->second));
     });
 }
 
@@ -560,7 +561,7 @@ std::string cmd_zcard(Ctx& c, const Request& r) {
     return c.store.read(r[1], [](const Entry* e) {
         if (!e) return resp::integer(0);
         if (e->value.type != ValueType::ZSet) return err_wrongtype();
-        return resp::integer(static_cast<int64_t>(e->value.zscores.size()));
+        return resp::integer(static_cast<int64_t>(e->value.zscores().size()));
     });
 }
 
@@ -570,8 +571,8 @@ std::string cmd_zincrby(Ctx& c, const Request& r) {
     return c.store.write(r[1], [&](Slot& slot) {
         Entry& e = slot.get_or_create(ValueType::ZSet);
         if (e.value.type != ValueType::ZSet) return err_wrongtype();
-        auto it = e.value.zscores.find(r[3]);
-        double cur = (it != e.value.zscores.end() ? it->second : 0) + *delta;
+        auto it = e.value.zscores().find(r[3]);
+        double cur = (it != e.value.zscores().end() ? it->second : 0) + *delta;
         if (std::isnan(cur)) return resp::error("ERR resulting score is not a number (NaN)");
         e.value.zset_put(r[3], cur);
         return resp::bulk_string(format_double(cur));
@@ -590,15 +591,15 @@ std::string cmd_zrange(Ctx& c, const Request& r) {
         if (!e) return resp::empty_array();
         if (e->value.type != ValueType::ZSet) return err_wrongtype();
         int64_t s, t;
-        std::vector<std::string> items;
-        if (resolve_range(*start, *stop, static_cast<int64_t>(e->value.zorder.size()), s, t)) {
-            auto it = std::next(e->value.zorder.begin(), s);
+        resp::ArrayWriter reply;
+        if (resolve_range(*start, *stop, static_cast<int64_t>(e->value.zorder().size()), s, t)) {
+            auto it = std::next(e->value.zorder().begin(), s);
             for (int64_t i = s; i <= t; ++i, ++it) {
-                items.push_back(resp::bulk_string(it->second));
-                if (withscores) items.push_back(resp::bulk_string(format_double(it->first)));
+                reply.bulk(it->second);
+                if (withscores) reply.bulk(format_double(it->first));
             }
         }
-        return resp::array(items);
+        return reply.finish();
     });
 }
 
@@ -727,7 +728,12 @@ const std::unordered_map<std::string, Command>& command_table() {
 
 std::string dispatch(Store& store, Server& server, const Request& req) {
     if (req.empty()) return "";
-    std::string name = upper(req[0]);
+    // Clients almost always send command names in upper case already, so
+    // only pay for a case-folded copy when one is needed.
+    const std::string& raw = req[0];
+    bool is_upper = std::none_of(raw.begin(), raw.end(), [](unsigned char c) { return std::islower(c); });
+    std::string folded = is_upper ? std::string() : upper(raw);
+    const std::string& name = is_upper ? raw : folded;
     auto it = command_table().find(name);
     if (it == command_table().end()) return resp::error("ERR unknown command '" + req[0] + "'");
 

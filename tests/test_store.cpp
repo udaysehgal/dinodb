@@ -10,7 +10,7 @@ void put_string(Store& s, const std::string& key, const std::string& val) {
 
 std::string zorder_members(const Value& v) {
     std::string order;
-    for (auto& [score, member] : v.zorder) order += member;
+    for (auto& [score, member] : v.zorder()) order += member;
     return order;
 }
 }  // namespace
@@ -60,9 +60,9 @@ TEST(huge_expire_does_not_overflow) {
 
 TEST(emptied_container_is_deleted) {
     Store s;
-    s.write("l", [](Slot& slot) { slot.get_or_create(ValueType::List).value.list.push_back("x"); });
+    s.write("l", [](Slot& slot) { slot.get_or_create(ValueType::List).value.list().push_back("x"); });
     CHECK(s.exists("l"));
-    s.write("l", [](Slot& slot) { slot.get()->value.list.pop_front(); });
+    s.write("l", [](Slot& slot) { slot.get()->value.list().pop_front(); });
     CHECK(!s.exists("l"));
 }
 
@@ -93,7 +93,7 @@ TEST(zset_put_updates_existing_member_order) {
     v.zset_put("b", 2.0);
     v.zset_put("a", 5.0);
     CHECK_EQ(zorder_members(v), std::string("ba"));
-    CHECK_EQ(v.zorder.size(), size_t{2});
+    CHECK_EQ(v.zorder().size(), size_t{2});
 }
 
 TEST(zset_ties_break_lexicographically) {
