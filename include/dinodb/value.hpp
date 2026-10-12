@@ -2,11 +2,12 @@
 
 #include <chrono>
 #include <deque>
-#include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace dinodb {
 
@@ -35,20 +36,16 @@ struct Value {
     std::deque<std::string> list;
     std::unordered_set<std::string> set;
 
-    // Sorted set: member -> score, plus a score-ordered index for range scans.
+    // Sorted set: member -> score, plus a (score, member)-ordered index for
+    // range scans. Ordering by the pair gives Redis's tie-break rule (equal
+    // scores sort lexicographically by member) and O(log n) updates.
     std::unordered_map<std::string, double> zscores;
-    std::multimap<double, std::string> zorder;
+    std::set<std::pair<double, std::string>> zorder;
 
     void zset_put(const std::string& member, double score) {
         auto it = zscores.find(member);
         if (it != zscores.end()) {
-            auto range = zorder.equal_range(it->second);
-            for (auto r = range.first; r != range.second; ++r) {
-                if (r->second == member) {
-                    zorder.erase(r);
-                    break;
-                }
-            }
+            zorder.erase({it->second, member});
             it->second = score;
         } else {
             zscores.emplace(member, score);
@@ -59,15 +56,22 @@ struct Value {
     bool zset_remove(const std::string& member) {
         auto it = zscores.find(member);
         if (it == zscores.end()) return false;
-        auto range = zorder.equal_range(it->second);
-        for (auto r = range.first; r != range.second; ++r) {
-            if (r->second == member) {
-                zorder.erase(r);
-                break;
-            }
-        }
+        zorder.erase({it->second, member});
         zscores.erase(it);
         return true;
+    }
+
+    // Redis deletes a key as soon as its container becomes empty; strings
+    // are never "empty" in this sense (SET k "" is a real value).
+    bool empty_container() const {
+        switch (type) {
+            case ValueType::String: return false;
+            case ValueType::Hash: return hash.empty();
+            case ValueType::List: return list.empty();
+            case ValueType::Set: return set.empty();
+            case ValueType::ZSet: return zscores.empty();
+        }
+        return false;
     }
 };
 
