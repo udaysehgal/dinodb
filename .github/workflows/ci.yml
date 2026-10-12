@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / ${{ matrix.sanitize || 'release' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        sanitize: ["", thread, "address,undefined"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          if [ -n "${{ matrix.sanitize }}" ]; then
+            cmake -B build -DCMAKE_BUILD_TYPE=Debug -DDINODB_SANITIZE=${{ matrix.sanitize }}
+          else
+            cmake -B build -DCMAKE_BUILD_TYPE=Release
+          fi
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Unit tests
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Network stress test
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          ./build/dinodb --port 7379 --rdb "$RUNNER_TEMP/ci.rdb" > server.log 2>&1 &
+          pid=$!
+          for i in $(seq 50); do nc -z 127.0.0.1 7379 && break; sleep 0.2; done
+          python3 scripts/stress.py 7379
+          kill -INT $pid && wait $pid
+          cat server.log
+          ! grep -q "Sanitizer" server.log
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t dinodb .
