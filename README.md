@@ -94,18 +94,36 @@ and loopback on one laptop, not the servers, so these workloads can't
 separate them. They do show DinoDB scaling with workers (`SET` at P=16:
 1.39M → 2.20M from 1 to 4 workers).
 
-**Where DinoDB loses:**
+**Where DinoDB loses** (in the M4 runs above, which predate the
+epoll/kqueue loop and the reply batching described below):
 
-- **Per-core efficiency.** Single-threaded, DinoDB needs about 25–30%
+- **Per-core efficiency.** Single-threaded, DinoDB needed about 25–30%
   more CPU per request than Redis (e.g. 0.75 vs 0.57 µs for pipelined
-  `SET`), and `dinodb-1` trails Redis throughout. Redis's single
-  event loop is very tightly optimized; DinoDB pays for locks, per-request
-  allocations, and rebuilding the `poll()` set on every loop iteration.
+  `SET`), and `dinodb-1` trailed Redis throughout. DinoDB pays for locks
+  and per-request allocations that Redis's single event loop avoids.
 - **CPU cost under light load.** Without pipelining, CPU per request
-  grows with the worker count (6.6 → 13.8 → 23.7 µs for 1/2/4 workers at
+  grew with the worker count (6.6 → 13.8 → 23.7 µs for 1/2/4 workers at
   the same throughput). Each worker gets fewer requests per wake-up, so the
   fixed cost of waking up isn't amortized. If you aren't CPU-bound, fewer
   workers is cheaper. Redis's I/O threads show the same effect (15 µs vs 6).
+
+**Since then** (Linux, 4 vCPUs, Redis 7.0, 1M keys, same harness). Not
+directly comparable with the M4 numbers, but measured head to head on
+one machine:
+
+- Workers use `epoll`/`kqueue` instead of rebuilding a `poll()` set every
+  iteration. On Linux, CPU per request without pipelining now stays flat
+  at about 12–14 µs from 1 to 4 workers, close to Redis's 12.
+- Workers read every ready connection before sending any reply, the order
+  Redis uses. Sending each reply right away cost about 50% more kernel
+  time per request than Redis for the same syscalls. Single-worker
+  pipelined `GET` went from about 441k to 567k req/s, and server CPU from
+  2.1 to 1.7 µs/req (Redis: about 1.8). With 4 workers, the
+  median of three runs is about 15% less CPU per pipelined `GET` and 7%
+  less per `SET`, with no change on `LRANGE`.
+- The background expiry sweep skips shards that hold no TTLs. Before,
+  a server with a million keys and no TTLs spent about 5% of a core
+  walking them, even when idle.
 
 Reproduce with:
 
