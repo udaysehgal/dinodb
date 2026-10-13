@@ -31,7 +31,7 @@ store) with a much smaller feature set and a different concurrency model:
 |---|---|---|
 | Language | C | C++20 |
 | Command execution | Single-threaded event loop (one thread runs all commands, so no locking is needed); optional multi-threaded socket I/O since Redis 6 | Multi-threaded throughout: keys are sharded across N `std::shared_mutex`-guarded buckets, and commands on different shards run genuinely in parallel |
-| I/O model | Custom `ae` event loop over epoll/kqueue/select | A dedicated acceptor thread round-robins new connections across a fixed worker pool, each worker running its own `poll()` loop |
+| I/O model | Custom `ae` event loop over epoll/kqueue/select | A dedicated acceptor thread round-robins new connections across a fixed worker pool, each worker running its own epoll/kqueue loop |
 | Memory layout | Adaptive small-object encodings per type (`listpack`, `intset`, `embstr`, etc.) that switch representation by size | One fixed-layout struct per key holding all possible container types; simpler, but higher per-key memory overhead |
 | Data types | Strings, hashes, lists, sets, sorted sets, streams, bitmaps, HyperLogLog, geospatial | Strings, hashes, lists, sets, sorted sets |
 | Persistence | RDB snapshots and/or an append-only file (AOF) with configurable fsync policy | Periodic/manual snapshots only, in its own simple length-prefixed binary format |

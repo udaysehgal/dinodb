@@ -117,6 +117,7 @@ void worker_loop(WorkerState& ws, std::atomic<bool>& running, Server& server) {
     std::unordered_map<int, ConnState> conns;
     std::vector<Poller::Event> events;
     std::vector<int> to_close;
+    std::vector<int> to_flush;
     char buf[65536];
 
     Poller poller;
@@ -130,6 +131,7 @@ void worker_loop(WorkerState& ws, std::atomic<bool>& running, Server& server) {
         if (poller.wait(events, 200) <= 0) continue;
 
         to_close.clear();
+        to_flush.clear();
         for (const Poller::Event& ev : events) {
             if (ev.fd == ws.wake_r) {
                 char drain[64];
@@ -157,16 +159,27 @@ void worker_loop(WorkerState& ws, std::atomic<bool>& running, Server& server) {
             // itself shows up as recv() returning 0.
             bool ok = !ev.error;
             if (ok && ev.readable) ok = handle_readable(ev.fd, cs, server, buf, sizeof(buf));
-            if (ok && !cs.outbuf.empty()) ok = flush_output(ev.fd, cs);
-            if (cs.close_after_flush && cs.outbuf.empty()) ok = false;
             if (!ok) {
                 cs.closing = true;
                 to_close.push_back(ev.fd);
                 continue;
             }
+            if (!cs.outbuf.empty() || cs.close_after_flush) to_flush.push_back(ev.fd);
+        }
+        for (int fd : to_flush) {
+            auto it = conns.find(fd);
+            if (it == conns.end() || it->second.closing) continue;
+            ConnState& cs = it->second;
+            bool ok = cs.outbuf.empty() || flush_output(fd, cs);
+            if (cs.close_after_flush && cs.outbuf.empty()) ok = false;
+            if (!ok) {
+                cs.closing = true;
+                to_close.push_back(fd);
+                continue;
+            }
             bool want_write = !cs.outbuf.empty();
             if (want_write != cs.want_write) {
-                poller.set_write(ev.fd, want_write);
+                poller.set_write(fd, want_write);
                 cs.want_write = want_write;
             }
         }

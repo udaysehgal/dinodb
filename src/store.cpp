@@ -4,7 +4,8 @@
 
 namespace dinodb {
 
-Slot::Slot(Shard::Map& map, const std::string& key) : map_(map), key_(key), it_(map.find(key)) {
+Slot::Slot(Shard& shard, const std::string& key)
+    : shard_(shard), map_(shard.map), key_(key), it_(map_.find(key)) {
     if (it_ != map_.end() && it_->second.expired_now()) {
         map_.erase(it_);
         it_ = map_.end();
@@ -12,7 +13,12 @@ Slot::Slot(Shard::Map& map, const std::string& key) : map_(map), key_(key), it_(
 }
 
 Slot::~Slot() {
-    if (it_ != map_.end() && it_->second.value.empty_container()) map_.erase(it_);
+    if (it_ == map_.end()) return;
+    if (it_->second.value.empty_container()) {
+        map_.erase(it_);
+    } else if (it_->second.expires_at.has_value()) {
+        shard_.may_have_ttl = true;
+    }
 }
 
 Entry& Slot::get_or_create(ValueType type) {
@@ -111,6 +117,7 @@ bool Store::persist(const std::string& key) {
 void Store::restore(const std::string& key, Entry entry) {
     Shard& s = shard_for(key);
     std::unique_lock lock(s.mtx);
+    if (entry.expires_at.has_value()) s.may_have_ttl = true;
     s.map[key] = std::move(entry);
 }
 
@@ -135,7 +142,20 @@ size_t Store::sweep_expired_step() {
     Shard& s = *shards_[sweep_cursor_.fetch_add(1) % shards_.size()];
     auto t = now();
     std::unique_lock lock(s.mtx);
-    return std::erase_if(s.map, [&](const auto& kv) { return kv.second.expired(t); });
+    if (!s.may_have_ttl) return 0;
+    size_t removed = 0;
+    bool ttl_left = false;
+    for (auto it = s.map.begin(); it != s.map.end();) {
+        if (it->second.expired(t)) {
+            it = s.map.erase(it);
+            ++removed;
+        } else {
+            ttl_left = ttl_left || it->second.expires_at.has_value();
+            ++it;
+        }
+    }
+    s.may_have_ttl = ttl_left;
+    return removed;
 }
 
 size_t Store::size() {

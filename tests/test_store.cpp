@@ -1,3 +1,6 @@
+#include <chrono>
+#include <thread>
+
 #include "dinodb/store.hpp"
 #include "test_framework.hpp"
 
@@ -77,6 +80,27 @@ TEST(sweep_removes_expired_keys) {
     for (size_t i = 0; i < s.shard_count(); ++i) removed += s.sweep_expired_step();
     CHECK_EQ(removed, size_t{100});
     CHECK_EQ(s.size(), size_t{1});
+}
+
+// The sweep skips shards it believes hold no TTLs; a TTL added after a
+// sweep cleared that belief must still be found, whichever path set it.
+TEST(sweep_finds_ttls_set_after_an_empty_pass) {
+    Store s(1);
+    put_string(s, "a", "v");
+    CHECK_EQ(s.sweep_expired_step(), size_t{0});  // no TTLs: nothing to do
+
+    s.write("a", [](Slot& slot) { slot.get()->expires_at = now(); });
+    CHECK_EQ(s.sweep_expired_step(), size_t{1});
+    CHECK_EQ(s.sweep_expired_step(), size_t{0});
+
+    put_string(s, "b", "v");
+    CHECK(s.pexpire("b", 1));
+    Entry e;
+    e.expires_at = now();
+    s.restore("c", std::move(e));
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK_EQ(s.sweep_expired_step(), size_t{2});
+    CHECK_EQ(s.size(), size_t{0});
 }
 
 TEST(zset_orders_by_score) {

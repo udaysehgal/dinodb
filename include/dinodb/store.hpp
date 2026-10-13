@@ -47,6 +47,12 @@ public:
     using Map = std::unordered_map<std::string, Entry>;
     RwLock mtx;
     Map map;
+    // True if any entry in this shard might carry a TTL. Set (under the
+    // exclusive lock) whenever a write leaves an entry with a TTL, cleared
+    // by the expiry sweep once a scan finds none. Lets the sweep skip
+    // shards with no TTLs instead of walking every node of a large
+    // keyspace ten times a second for nothing.
+    bool may_have_ttl = false;
 };
 
 inline TimePoint now() { return std::chrono::system_clock::now(); }
@@ -57,7 +63,7 @@ inline TimePoint now() { return std::chrono::system_clock::now(); }
 // container that was emptied is deleted, matching Redis semantics.
 class Slot {
 public:
-    Slot(Shard::Map& map, const std::string& key);
+    Slot(Shard& shard, const std::string& key);
     ~Slot();
     Slot(const Slot&) = delete;
     Slot& operator=(const Slot&) = delete;
@@ -71,6 +77,7 @@ public:
     void remove();
 
 private:
+    Shard& shard_;
     Shard::Map& map_;
     const std::string& key_;
     Shard::Map::iterator it_;
@@ -101,7 +108,7 @@ public:
     auto write(const std::string& key, F&& fn) {
         Shard& s = shard_for(key);
         std::unique_lock lock(s.mtx);
-        Slot slot(s.map, key);
+        Slot slot(s, key);
         return fn(slot);
     }
 
