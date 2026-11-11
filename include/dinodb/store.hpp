@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -112,6 +113,60 @@ public:
         return fn(slot);
     }
 
+    // Multi-key versions of read/write: lock every shard the keys touch,
+    // in ascending shard order, then run fn with all of them held, so the
+    // command is atomic as a whole (MSET, MGET, multi-key DEL/EXISTS).
+    // Every multi-shard locker uses the same ascending order and single-key
+    // operations and for_each never hold more than one shard, so no two
+    // threads can each hold a lock the other is waiting for.
+    //
+    // write_many: fn(MultiWrite&), where mw.with(key, g) runs g(Slot&).
+    // read_many:  fn(MultiRead&),  where mr.get(key) returns const Entry*
+    //             (null if missing or expired); it must not escape fn.
+    class MultiWrite {
+    public:
+        template <typename G>
+        auto with(const std::string& key, G&& g) {
+            Slot slot(store_.shard_for(key), key);
+            return g(slot);
+        }
+
+    private:
+        friend class Store;
+        explicit MultiWrite(Store& s) : store_(s) {}
+        Store& store_;
+    };
+
+    class MultiRead {
+    public:
+        const Entry* get(const std::string& key) {
+            Shard& s = store_.shard_for(key);
+            auto it = s.map.find(key);
+            return (it == s.map.end() || it->second.expired_now()) ? nullptr : &it->second;
+        }
+
+    private:
+        friend class Store;
+        explicit MultiRead(Store& s) : store_(s) {}
+        Store& store_;
+    };
+
+    template <typename Keys, typename F>
+    auto write_many(const Keys& keys, F&& fn) {
+        std::vector<std::unique_lock<RwLock>> locks;
+        for (size_t i : sorted_shards(keys)) locks.emplace_back(shards_[i]->mtx);
+        MultiWrite mw(*this);
+        return fn(mw);
+    }
+
+    template <typename Keys, typename F>
+    auto read_many(const Keys& keys, F&& fn) {
+        std::vector<std::shared_lock<RwLock>> locks;
+        for (size_t i : sorted_shards(keys)) locks.emplace_back(shards_[i]->mtx);
+        MultiRead mr(*this);
+        return fn(mr);
+    }
+
     bool del(const std::string& key);
     bool exists(const std::string& key);
     // Non-positive TTLs delete the key, as in Redis. Returns false if the
@@ -140,6 +195,18 @@ public:
     size_t size();
 
 private:
+    size_t shard_index(const std::string& key) const { return hasher_(key) % shards_.size(); }
+
+    // Distinct shard indexes for `keys`, ascending: the global lock order.
+    template <typename Keys>
+    std::vector<size_t> sorted_shards(const Keys& keys) const {
+        std::vector<size_t> idx;
+        for (const std::string& k : keys) idx.push_back(shard_index(k));
+        std::sort(idx.begin(), idx.end());
+        idx.erase(std::unique(idx.begin(), idx.end()), idx.end());
+        return idx;
+    }
+
     std::vector<std::unique_ptr<Shard>> shards_;
     std::hash<std::string> hasher_;
     std::atomic<size_t> sweep_cursor_{0};

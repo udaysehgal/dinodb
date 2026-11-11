@@ -30,9 +30,9 @@ store) with a much smaller feature set and a different concurrency model:
 | | Redis | DinoDB |
 |---|---|---|
 | Language | C | C++20 |
-| Command execution | Single-threaded event loop (one thread runs all commands, so no locking is needed); optional multi-threaded socket I/O since Redis 6 | Multi-threaded throughout: keys are sharded across N `std::shared_mutex`-guarded buckets, and commands on different shards run genuinely in parallel |
-| I/O model | Custom `ae` event loop over epoll/kqueue/select | A dedicated acceptor thread round-robins new connections across a fixed worker pool, each worker running its own epoll/kqueue loop |
-| Memory layout | Adaptive small-object encodings per type (`listpack`, `intset`, `embstr`, etc.) that switch representation by size | One fixed-layout struct per key holding all possible container types; simpler, but higher per-key memory overhead |
+| Command execution | Single-threaded event loop (one thread runs all commands, so no locking is needed); optional multi-threaded socket I/O since Redis 6 | Multi-threaded throughout: keys are sharded across 32 reader-writer-locked buckets, and commands on different shards run genuinely in parallel |
+| I/O model | Custom `ae` event loop over epoll/kqueue/select | A dedicated acceptor thread round-robins new connections across a fixed worker pool, each worker running its own epoll (Linux) / kqueue (macOS) loop |
+| Memory layout | Adaptive small-object encodings per type (`listpack`, `intset`, `embstr`, etc.) that switch representation by size | Strings stored inline in the hash-table node; other container types behind one pointer. No size-adaptive encodings, so collections cost more memory than in Redis |
 | Data types | Strings, hashes, lists, sets, sorted sets, streams, bitmaps, HyperLogLog, geospatial | Strings, hashes, lists, sets, sorted sets |
 | Persistence | RDB snapshots and/or an append-only file (AOF) with configurable fsync policy | Periodic/manual snapshots only, in its own simple length-prefixed binary format |
 | Transactions / scripting | `MULTI`/`EXEC`, Lua scripting, functions | Not implemented |
@@ -167,7 +167,7 @@ Set via flags or environment variables:
 | Flag | Env var | Default | Meaning |
 |---|---|---|---|
 | `--port` | `DINODB_PORT` | `7379` | TCP port to listen on |
-| `--bind` | `DINODB_BIND` | `0.0.0.0` | Bind address |
+| `--bind` | `DINODB_BIND` | `127.0.0.1` | Bind address. Loopback only by default because there is no `AUTH`; the Docker image sets `0.0.0.0` |
 | `--workers` | `DINODB_WORKERS` | number of CPU cores | Worker thread count |
 | `--rdb` | `DINODB_RDB_PATH` | `dinodb.rdb` | Snapshot file path |
 | `--autosave` | `DINODB_AUTOSAVE_SEC` | `300` | Autosave interval in seconds (`0` disables; a final save still happens on clean shutdown) |
@@ -182,8 +182,9 @@ Set via flags or environment variables:
 - **Sorted sets:** `ZADD`, `ZSCORE`, `ZREM`, `ZCARD`, `ZINCRBY`, `ZRANGE` (with `WITHSCORES`)
 - **Server:** `PING`, `ECHO`, `INFO`, `SAVE`/`BGSAVE`, `SELECT`, `CONFIG` (stub)
 
-Multi-key commands (`MSET`, `MGET`, `DEL`, `EXISTS`) apply each key
-atomically but are not atomic as a whole, unlike in Redis. `SELECT` only
+Multi-key commands (`MSET`, `MGET`, `DEL`, `EXISTS`) are atomic as a
+whole, as in Redis: they lock every shard they touch, in ascending shard
+order so two of them can never deadlock. `SELECT` only
 accepts database `0`.
 
 Not yet implemented (contributions welcome): pub/sub, transactions

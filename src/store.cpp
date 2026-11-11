@@ -51,8 +51,7 @@ Store::Store(size_t shard_count) {
 }
 
 Shard& Store::shard_for(const std::string& key) {
-    size_t h = hasher_(key);
-    return *shards_[h % shards_.size()];
+    return *shards_[shard_index(key)];
 }
 
 bool Store::del(const std::string& key) {

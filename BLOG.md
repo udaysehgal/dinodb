@@ -67,9 +67,9 @@ flowchart TB
         D["dispatch(cmd, args)\n~40 command handlers"]
     end
     subgraph data["Sharded store"]
-        S0["Shard 0\nshared_mutex + hashmap"]
-        S1["Shard 1\nshared_mutex + hashmap"]
-        SN["Shard 31\nshared_mutex + hashmap"]
+        S0["Shard 0\nrwlock + hashmap"]
+        S1["Shard 1\nrwlock + hashmap"]
+        SN["Shard 31\nrwlock + hashmap"]
     end
 
     A -- "round-robin new fd" --> W1
@@ -114,7 +114,7 @@ exactly one of them:
 ```cpp
 class Shard {
 public:
-    std::shared_mutex mtx;
+    RwLock mtx;   // pthread_rwlock_t; see "Making it faster"
     std::unordered_map<std::string, Entry> map;
 };
 
@@ -153,33 +153,41 @@ expensive, hard-to-verify* parallelism.
 
 ### What actually lives in a shard
 
-Rather than a tagged union of heap-allocated containers, every key maps
-to one fixed-layout `Value` struct big enough to hold any of the five
-supported types:
+Strings, by far the most common value, live inline in the hash-table
+node; every other type lives behind a single pointer that is only
+allocated for keys that need it:
 
 ```cpp
-struct Value {
-    ValueType type;                              // which field is "live"
-    std::string str;                              // String
-    std::unordered_map<std::string, std::string> hash;  // Hash
-    std::deque<std::string> list;                  // List
-    std::unordered_set<std::string> set;            // Set
+struct Containers {                                  // allocated on first use
+    std::unordered_map<std::string, std::string> hash;
+    std::deque<std::string> list;
+    std::unordered_set<std::string> set;
     std::unordered_map<std::string, double> zscores; // ZSet: member -> score
     std::set<std::pair<double, std::string>> zorder; // ZSet: (score, member)
 };
 
+struct Value {
+    ValueType type;
+    std::string str;                      // String, inline
+    std::unique_ptr<Containers> containers_;  // via hash(), list(), ...
+};
+
 struct Entry {
+    std::optional<std::chrono::system_clock::time_point> expires_at;  // first: same cache line as the key
     Value value;
-    std::optional<std::chrono::system_clock::time_point> expires_at;
 };
 ```
 
-This is a deliberate simplification versus e.g. Redis's `listpack`/
-`intset`/`embstr` family of size-tuned encodings, or an epoch-reclaimed
-structure that hands back memory to other threads lazily. Every key
-here costs roughly `sizeof(Value)` regardless of whether it holds a
-3-byte string or a 10,000-entry hash — noticeably more memory overhead
-per key, in exchange for an ownership model simple enough that there is
+The first version put every container inline in one fixed-layout struct.
+That was simpler, but it made every key's hash-table node 264 bytes,
+more than four cache lines, even for a 3-byte string. Since a `GET` is
+mostly cache misses walking those nodes, it cost speed as well as
+memory; see [Making it faster](#making-it-faster). This is still a
+deliberate simplification versus Redis's `listpack`/`intset`/`embstr`
+family of size-tuned encodings, or an epoch-reclaimed structure that
+hands back memory to other threads lazily: collections pay full
+standard-library container overhead, in exchange for an ownership model
+simple enough that there is
 no reclamation problem to solve at all: a `std::unique_lock` is held,
 the struct is mutated in place, the lock is released. No epochs, no
 hazard pointers, no deferred frees.
@@ -405,8 +413,11 @@ wording. Every handler then follows the same shape: parse and validate
 arguments up front (so a bad `ZADD` score can't leave a half-applied
 update), then do all its work on a key inside a single `Store::read` or
 `Store::write` call and encode the reply. Multi-key commands (`MSET`,
-`MGET`, `DEL`) take one shard lock per key in turn, so each key's update
-is atomic but, unlike in Redis, the command as a whole is not.
+`MGET`, `DEL`, `EXISTS`) go through `Store::write_many` / `read_many`,
+which lock every shard the keys touch in ascending shard order and hold
+them for the whole command, so the command is atomic as a whole, as in
+Redis. A fixed global order is enough to rule out deadlock: single-key
+commands and `for_each` never hold more than one shard at a time.
 
 ### Asymptotic cost per operation
 
@@ -505,7 +516,7 @@ sequenceDiagram
     CB->>Sh: unlock
 ```
 
-Nothing here is DinoDB-specific — it's exactly what a `std::shared_mutex`
+Nothing here is DinoDB-specific — it's exactly what a reader-writer lock
 guarantees. The interesting part is what *doesn't* happen: a third
 client doing `SET other:key 1` on a different shard runs concurrently
 with both of these, untouched, on a third worker thread, the whole
@@ -553,8 +564,8 @@ version of anything:
 | Use it when | Reach for something else when |
 |---|---|
 | Workload is CPU-bound across many independent keys | Workload is dominated by a handful of hot keys — sharding doesn't help those |
-| You want to reason about correctness with plain `std::shared_mutex` semantics | You need to squeeze out the last 20% of throughput and can justify a lock-free design's audit cost |
-| Memory headroom for a fixed-layout `Value` per key is fine | Key count is huge and per-key overhead has to be minimized |
+| You want to reason about correctness with plain reader-writer lock semantics | You need to squeeze out the last 20% of throughput and can justify a lock-free design's audit cost |
+| Memory headroom for standard-library containers per key is fine | Key count is huge and per-key overhead has to be minimized |
 | A snapshot-based durability model is acceptable | You need Redis's AOF-level durability guarantees |
 
 ## What's not here yet

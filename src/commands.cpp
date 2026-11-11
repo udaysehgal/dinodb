@@ -6,6 +6,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <optional>
 #include <unordered_map>
 
@@ -213,23 +214,35 @@ std::string cmd_decrby(Ctx& c, const Request& r) {
     return incr_by(c.store, r[1], -*v);
 }
 
-// MSET/MGET touch keys in different shards one at a time, so unlike Redis
-// they are not atomic as a whole; each individual key update is.
+// Keys r[first], r[first+step], ... as references into the request.
+std::vector<std::reference_wrapper<const std::string>> keys_of(const Request& r, size_t first, size_t step) {
+    std::vector<std::reference_wrapper<const std::string>> keys;
+    for (size_t i = first; i < r.size(); i += step) keys.emplace_back(r[i]);
+    return keys;
+}
+
+// Multi-key commands lock every shard they touch (in ascending shard order)
+// for the whole command, so like Redis they are atomic as a whole: no other
+// client can observe half an MSET or an MGET that straddles a write.
 std::string cmd_mset(Ctx& c, const Request& r) {
     if (r.size() % 2 != 1) return resp::error("ERR wrong number of arguments for 'mset' command");
-    for (size_t i = 1; i + 1 < r.size(); i += 2) {
-        c.store.write(r[i], [&](Slot& slot) { slot.reset(ValueType::String).value.str = r[i + 1]; });
-    }
+    c.store.write_many(keys_of(r, 1, 2), [&](Store::MultiWrite& mw) {
+        for (size_t i = 1; i + 1 < r.size(); i += 2) {
+            mw.with(r[i], [&](Slot& slot) { slot.reset(ValueType::String).value.str = r[i + 1]; });
+        }
+    });
     return resp::simple_string("OK");
 }
 
 std::string cmd_mget(Ctx& c, const Request& r) {
     std::vector<std::string> items;
-    for (size_t i = 1; i < r.size(); ++i) {
-        items.push_back(c.store.read(r[i], [](const Entry* e) {
-            return e && e->value.type == ValueType::String ? resp::bulk_string(e->value.str) : resp::nil_bulk();
-        }));
-    }
+    c.store.read_many(keys_of(r, 1, 1), [&](Store::MultiRead& mr) {
+        for (size_t i = 1; i < r.size(); ++i) {
+            const Entry* e = mr.get(r[i]);
+            items.push_back(e && e->value.type == ValueType::String ? resp::bulk_string(e->value.str)
+                                                                    : resp::nil_bulk());
+        }
+    });
     return resp::array(items);
 }
 
@@ -237,17 +250,26 @@ std::string cmd_mget(Ctx& c, const Request& r) {
 
 std::string cmd_del(Ctx& c, const Request& r) {
     int64_t count = 0;
-    for (size_t i = 1; i < r.size(); ++i) {
-        if (c.store.del(r[i])) ++count;
-    }
+    c.store.write_many(keys_of(r, 1, 1), [&](Store::MultiWrite& mw) {
+        for (size_t i = 1; i < r.size(); ++i) {
+            mw.with(r[i], [&](Slot& slot) {
+                if (slot.get()) {
+                    slot.remove();
+                    ++count;
+                }
+            });
+        }
+    });
     return resp::integer(count);
 }
 
 std::string cmd_exists(Ctx& c, const Request& r) {
     int64_t count = 0;
-    for (size_t i = 1; i < r.size(); ++i) {
-        if (c.store.exists(r[i])) ++count;
-    }
+    c.store.read_many(keys_of(r, 1, 1), [&](Store::MultiRead& mr) {
+        for (size_t i = 1; i < r.size(); ++i) {
+            if (mr.get(r[i])) ++count;
+        }
+    });
     return resp::integer(count);
 }
 
