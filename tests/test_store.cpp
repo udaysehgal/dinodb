@@ -1,3 +1,6 @@
+#include <chrono>
+#include <thread>
+
 #include "dinodb/store.hpp"
 #include "test_framework.hpp"
 
@@ -10,7 +13,7 @@ void put_string(Store& s, const std::string& key, const std::string& val) {
 
 std::string zorder_members(const Value& v) {
     std::string order;
-    for (auto& [score, member] : v.zorder) order += member;
+    for (auto& [score, member] : v.zorder()) order += member;
     return order;
 }
 }  // namespace
@@ -60,9 +63,9 @@ TEST(huge_expire_does_not_overflow) {
 
 TEST(emptied_container_is_deleted) {
     Store s;
-    s.write("l", [](Slot& slot) { slot.get_or_create(ValueType::List).value.list.push_back("x"); });
+    s.write("l", [](Slot& slot) { slot.get_or_create(ValueType::List).value.list().push_back("x"); });
     CHECK(s.exists("l"));
-    s.write("l", [](Slot& slot) { slot.get()->value.list.pop_front(); });
+    s.write("l", [](Slot& slot) { slot.get()->value.list().pop_front(); });
     CHECK(!s.exists("l"));
 }
 
@@ -79,6 +82,27 @@ TEST(sweep_removes_expired_keys) {
     CHECK_EQ(s.size(), size_t{1});
 }
 
+// The sweep skips shards it believes hold no TTLs; a TTL added after a
+// sweep cleared that belief must still be found, whichever path set it.
+TEST(sweep_finds_ttls_set_after_an_empty_pass) {
+    Store s(1);
+    put_string(s, "a", "v");
+    CHECK_EQ(s.sweep_expired_step(), size_t{0});  // no TTLs: nothing to do
+
+    s.write("a", [](Slot& slot) { slot.get()->expires_at = now(); });
+    CHECK_EQ(s.sweep_expired_step(), size_t{1});
+    CHECK_EQ(s.sweep_expired_step(), size_t{0});
+
+    put_string(s, "b", "v");
+    CHECK(s.pexpire("b", 1));
+    Entry e;
+    e.expires_at = now();
+    s.restore("c", std::move(e));
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK_EQ(s.sweep_expired_step(), size_t{2});
+    CHECK_EQ(s.size(), size_t{0});
+}
+
 TEST(zset_orders_by_score) {
     Value v;
     v.zset_put("b", 2.0);
@@ -93,7 +117,7 @@ TEST(zset_put_updates_existing_member_order) {
     v.zset_put("b", 2.0);
     v.zset_put("a", 5.0);
     CHECK_EQ(zorder_members(v), std::string("ba"));
-    CHECK_EQ(v.zorder.size(), size_t{2});
+    CHECK_EQ(v.zorder().size(), size_t{2});
 }
 
 TEST(zset_ties_break_lexicographically) {

@@ -13,7 +13,7 @@
 namespace dinodb {
 
 struct ServerConfig {
-    std::string bind_addr = "0.0.0.0";
+    std::string bind_addr = "127.0.0.1";  // loopback only; there is no AUTH
     uint16_t port = 7379;
     int worker_threads = 0;         // 0 -> hardware_concurrency
     std::string rdb_path = "dinodb.rdb";

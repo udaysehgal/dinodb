@@ -26,8 +26,11 @@ public:
     static constexpr size_t kMaxInlineLen = 64 * 1024;
 
     void feed(const char* data, size_t len);
-    // Pops and returns the next complete request, if any. Returns nullopt
-    // once the parser has failed.
+    // Pops the next complete request into `out` (reusing its storage) and
+    // returns true, or returns false if none is complete yet or the parser
+    // has failed.
+    bool next(Request& out);
+    // Convenience form that allocates a fresh Request.
     std::optional<Request> next();
 
     bool failed() const { return !error_.empty(); }
@@ -38,10 +41,10 @@ private:
     size_t pos_ = 0;
     std::string error_;
 
-    std::optional<Request> fail(const std::string& msg);
+    bool fail(const std::string& msg);
 
-    std::optional<Request> try_parse_multibulk();
-    std::optional<Request> try_parse_inline();
+    bool try_parse_multibulk(Request& out);
+    bool try_parse_inline(Request& out);
     void compact();
 };
 
@@ -53,6 +56,24 @@ std::string bulk_string(const std::string& s);
 std::string nil_bulk();
 std::string array(const std::vector<std::string>& already_encoded_items);
 std::string nil_array();
+
+// Appends one bulk string to `out` in place.
+void append_bulk(std::string& out, const std::string& s);
+
+// Builds an array reply directly into one buffer instead of encoding every
+// element as its own string and concatenating them afterwards.
+class ArrayWriter {
+public:
+    void bulk(const std::string& s) {
+        append_bulk(body_, s);
+        ++count_;
+    }
+    std::string finish() const;
+
+private:
+    std::string body_;
+    size_t count_ = 0;
+};
 std::string empty_array();
 
 }  // namespace dinodb::resp

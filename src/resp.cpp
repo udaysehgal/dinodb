@@ -30,19 +30,21 @@ static bool parse_len(const std::string& s, size_t from, size_t to, long& out) {
     return ec == std::errc{} && end == s.data() + to;
 }
 
-std::optional<Request> Parser::fail(const std::string& msg) {
+bool Parser::fail(const std::string& msg) {
     error_ = "ERR Protocol error: " + msg;
-    return std::nullopt;
+    return false;
 }
 
-std::optional<Request> Parser::try_parse_multibulk() {
+// Fills `out` in place, reusing its strings' storage across requests: the
+// per-request allocation of a fresh vector showed up in profiles.
+bool Parser::try_parse_multibulk(Request& out) {
     size_t p = pos_;
-    if (p >= buf_.size() || buf_[p] != '*') return std::nullopt;
+    if (p >= buf_.size() || buf_[p] != '*') return false;
 
     size_t line_end = find_crlf(buf_, p);
     if (line_end == std::string::npos) {
         if (buf_.size() - p > 32) return fail("invalid multibulk length");
-        return std::nullopt;
+        return false;
     }
     long count = 0;
     if (!parse_len(buf_, p + 1, line_end, count) || count > kMaxArgs) {
@@ -52,50 +54,54 @@ std::optional<Request> Parser::try_parse_multibulk() {
 
     if (count < 0) {
         pos_ = cursor;
-        return Request{};
+        out.clear();
+        return true;
     }
 
-    Request req;
-    // Don't trust the client's count for the allocation size.
-    req.reserve(static_cast<size_t>(std::min(count, 1024L)));
-
+    // Never size an allocation from the client's count; out grows as
+    // arguments actually arrive.
+    size_t n = 0;
     for (long i = 0; i < count; ++i) {
-        if (cursor >= buf_.size()) return std::nullopt;
+        if (cursor >= buf_.size()) return false;
         if (buf_[cursor] != '$') return fail("expected '$', got '" + std::string(1, buf_[cursor]) + "'");
         size_t len_line_end = find_crlf(buf_, cursor);
         if (len_line_end == std::string::npos) {
             if (buf_.size() - cursor > 32) return fail("invalid bulk length");
-            return std::nullopt;
+            return false;
         }
         long blen = 0;
         if (!parse_len(buf_, cursor + 1, len_line_end, blen) || blen < 0 || blen > kMaxBulkLen) {
             return fail("invalid bulk length");
         }
         cursor = len_line_end + 2;
-        if (cursor + static_cast<size_t>(blen) + 2 > buf_.size()) return std::nullopt;
+        if (cursor + static_cast<size_t>(blen) + 2 > buf_.size()) return false;
         if (buf_[cursor + blen] != '\r' || buf_[cursor + blen + 1] != '\n') {
             return fail("bulk string not terminated by CRLF");
         }
-        req.emplace_back(buf_, cursor, static_cast<size_t>(blen));
+        if (n < out.size()) out[n].assign(buf_, cursor, static_cast<size_t>(blen));
+        else out.emplace_back(buf_, cursor, static_cast<size_t>(blen));
+        ++n;
         cursor += static_cast<size_t>(blen) + 2;
     }
 
+    out.resize(n);
     pos_ = cursor;
-    return req;
+    return true;
 }
 
-std::optional<Request> Parser::try_parse_inline() {
+bool Parser::try_parse_inline(Request& out) {
     size_t p = pos_;
     size_t nl = buf_.find('\n', p);
     if (nl == std::string::npos) {
         if (buf_.size() - p > kMaxInlineLen) return fail("too big inline request");
-        return std::nullopt;
+        return false;
     }
 
     size_t end = nl;
     if (end > p && buf_[end - 1] == '\r') --end;
 
-    Request req;
+    Request& req = out;
+    req.clear();
     size_t i = p;
     while (i < end) {
         while (i < end && buf_[i] == ' ') ++i;
@@ -106,36 +112,66 @@ std::optional<Request> Parser::try_parse_inline() {
     }
 
     pos_ = nl + 1;
-    return req;
+    return true;
 }
 
-std::optional<Request> Parser::next() {
-    if (failed()) return std::nullopt;
+bool Parser::next(Request& out) {
+    if (failed()) return false;
     if (pos_ >= buf_.size()) {
         buf_.clear();
         pos_ = 0;
-        return std::nullopt;
+        return false;
     }
 
-    std::optional<Request> result;
-    if (buf_[pos_] == '*') {
-        result = try_parse_multibulk();
-    } else {
-        result = try_parse_inline();
-    }
-
-    if (result.has_value()) {
-        compact();
-    }
-    return result;
+    bool ok = buf_[pos_] == '*' ? try_parse_multibulk(out) : try_parse_inline(out);
+    if (ok) compact();
+    return ok;
 }
 
-std::string simple_string(const std::string& s) { return "+" + s + "\r\n"; }
+std::optional<Request> Parser::next() {
+    Request req;
+    if (!next(req)) return std::nullopt;
+    return req;
+}
+
+// Reply builders append into one pre-sized string rather than chaining
+// operator+, which built a temporary per piece.
+std::string simple_string(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 3);
+    out += '+';
+    out += s;
+    out += "\r\n";
+    return out;
+}
 std::string error(const std::string& msg) { return "-" + msg + "\r\n"; }
 std::string integer(int64_t v) { return ":" + std::to_string(v) + "\r\n"; }
 
+void append_bulk(std::string& out, const std::string& s) {
+    char len[24];
+    auto [end, ec] = std::to_chars(len, len + sizeof(len), s.size());
+    out += '$';
+    out.append(len, end);
+    out += "\r\n";
+    out += s;
+    out += "\r\n";
+}
+
 std::string bulk_string(const std::string& s) {
-    return "$" + std::to_string(s.size()) + "\r\n" + s + "\r\n";
+    std::string out;
+    out.reserve(s.size() + 16);
+    append_bulk(out, s);
+    return out;
+}
+
+std::string ArrayWriter::finish() const {
+    std::string out;
+    out.reserve(body_.size() + 16);
+    out += '*';
+    out += std::to_string(count_);
+    out += "\r\n";
+    out += body_;
+    return out;
 }
 
 std::string nil_bulk() { return "$-1\r\n"; }
